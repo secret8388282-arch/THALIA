@@ -2,27 +2,6 @@
 # memory_heads_centroid.py
 """
 memory_heads_centroid.py — ЦЕНТРОИДНАЯ ПАМЯТЬ v1.4.3
-ИСПРАВЛЕНИЯ:
-- Центроиды как register_buffer (было Parameter)
-- Добавлены стабильные slot_embeddings для Linker
-- Улучшен Neural Linker с LayerNorm и правильной архитектурой
-- Добавлен repulsion loss против semantic collapse
-- Исправлено обновление variance (EMA)
-- Добавлен adaptive utility decay
-- Исправлены баги с индексами в curiosity
-- Добавлена нормализация после обновлений
-- ИСПРАВЛЕНИЕ 6.1: Правильное создание оптимизатора Linker
-- ИСПРАВЛЕНИЕ 6.2: Синхронизация transition_history и _transition_similarities
-- ИСПРАВЛЕНИЕ 6.3: Нормализация после merge
-- ИСПРАВЛЕНИЕ 6.4: Улучшенная стратегия split
-- ИСПРАВЛЕНИЕ 6.5: Улучшенная фильтрация в _train_linker
-- ИСПРАВЛЕНИЕ 6.6: Удаление мёртвого кода
-- ДОПОЛНИТЕЛЬНЫЕ ИСПРАВЛЕНИЯ 2025:
-    * Исправление 1: метод to() теперь пересоздаёт оптимизатор linker после перемещения
-    * Исправление 2: _train_linker() проверяет устройство и пересоздаёт оптимизатор при несовпадении
-    * Исправление 3: сохранение linker_hidden_dim в __init__
-    * Исправление 4: restore_best_linker() корректно переносит состояние на устройство
-    * Исправление 5: тензорное сравнение loss > 10 вместо .item()
 """
 import torch
 import torch.nn as nn
@@ -284,9 +263,6 @@ class CentroidMemoryManager(nn.Module):
             self.linker_updates = 0
             self.linker_losses = []
             
-            # ✅ Добавляем best model
-            self._best_linker_loss = float('inf')
-            self._best_linker_state = None
             self.linker.eval()
             
             self._update_lock = threading.Lock()
@@ -575,32 +551,19 @@ class CentroidMemoryManager(nn.Module):
         if not self.enable_linker or self.linker is None:
             return None
         
-        # 🔥🔥🔥 ИСПРАВЛЕНИЕ 2: Проверка устройства и пересоздание оптимизатора при необходимости
+        # 🔥🔥🔥 КЛЮЧЕВАЯ ПРОВЕРКА: пропускаем обучение если нет градиентов
+        if not torch.is_grad_enabled():
+            if self.step_count % 200 == 0:
+                logger.debug("🔇 Обучение linker'а пропущено (нет градиентов)")
+            return None
+        
+        # 🔥 Проверка устройства и создание оптимизатора при необходимости
         device = self.centroids.device
-        linker_device = next(self.linker.parameters()).device
+        self._ensure_linker_optimizer(device)
         
-        if linker_device != device:
-            logger.warning(f"⚠ Linker на {linker_device}, перемещаю на {device}")
-            self.linker = self.linker.to(device)
-            # После перемещения linker'а оптимизатор становится недействительным!
-            self.linker_optimizer = None
-            self.linker_scheduler = None
-        
-        # Создаём оптимизатор если нужно (теперь на правильном устройстве)
         if self.linker_optimizer is None:
-            self.linker_optimizer = torch.optim.AdamW(
-                self.linker.parameters(),
-                lr=self.linker_lr,
-                weight_decay=self.linker_weight_decay
-            )
-            self.linker_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                self.linker_optimizer, 
-                mode='min', 
-                factor=0.5, 
-                patience=20, 
-                min_lr=1e-5
-            )
-            logger.info(f"✅ Оптимизатор linker создан на {device}")
+            logger.warning("⚠ Оптимизатор linker не создан, пропускаю обучение")
+            return None
         
         if len(self.transition_history) < 32:
             if self.linker_updates == 0 and len(self.transition_history) > 0:
@@ -614,10 +577,9 @@ class CentroidMemoryManager(nn.Module):
             sim_list = list(self._transition_similarities)
             history_list = list(self.transition_history)
             
-            # Динамический порог - используем медиану или 0.15
             if sim_list:
                 median_sim = float(np.median(sim_list))
-                threshold = max(0.15, median_sim * 0.8)  # 80% от медианы, но не ниже 0.15
+                threshold = max(0.15, median_sim * 0.8)
             else:
                 threshold = 0.15
             
@@ -627,17 +589,14 @@ class CentroidMemoryManager(nn.Module):
             
             logger.debug(f"🔍 Linker: порог={threshold:.3f}, качественных={len(high_quality_pairs)}/{len(history_list)}")
         
-        if len(high_quality_pairs) < 16:
+        if len(high_quality_pairs) < 24:
             logger.debug(f"⚠ Недостаточно качественных пар: {len(high_quality_pairs)} < 16")
             return None
         
-        # ===================================================================
-        # ГРУППИРУЕМ И БАЛАНСИРУЕМ
-        # ===================================================================
+        # Группируем и балансируем
         pairs_by_target = defaultdict(list)
         
         for prev, nxt in high_quality_pairs:
-            # Базовые проверки
             if not (0 <= prev < self.num_slots and 0 <= nxt < self.num_slots):
                 continue
             if not (self.slot_active[prev] and self.slot_active[nxt]):
@@ -651,8 +610,7 @@ class CentroidMemoryManager(nn.Module):
         
         for target, pairs in pairs_by_target.items():
             target_counts[target] = len(pairs)
-            # Берем максимум 15 пар с каждого слота
-            sample_size = min(30, len(pairs))
+            sample_size = min(20, len(pairs))
             balanced_pairs.extend(random.sample(pairs, sample_size))
         
         logger.debug(f"📊 Распределение после балансировки: {target_counts}")
@@ -665,48 +623,20 @@ class CentroidMemoryManager(nn.Module):
         batch_size = min(32, len(balanced_pairs))
         sampled_pairs = random.sample(balanced_pairs, batch_size)
         
-        # ===========================================================
-        # 🔥🔥🔥 проверяем устройство (уже сделано выше)
-        # ===========================================================
         device = self.centroids.device
         
-        # Проверяем устройства параметров в оптимизаторе
-        if self.linker_optimizer is not None:
-            for group in self.linker_optimizer.param_groups:
-                for p in group['params']:
-                    if p.device != device:
-                        logger.warning(f"⚠ Параметр linker'а на {p.device}, перемещаю на {device}")
-                        p.data = p.data.to(device)
-                        if p.grad is not None:
-                            p.grad.data = p.grad.data.to(device)
-                    
-                    # Проверяем состояния оптимизатора
-                    if p in self.linker_optimizer.state:
-                        state = self.linker_optimizer.state[p]
-                        for key, value in list(state.items()):
-                            if isinstance(value, torch.Tensor) and value.device != device:
-                                state[key] = value.to(device)
-        
-        # ===================================================================
-        # СБОР ДАННЫХ (ИСПРАВЛЕНО)
-        # ===================================================================
+        # Сбор данных
         prev_vecs = []
         prev_embeds = []
         target_slots = []
         
         for prev, nxt in sampled_pairs:
-            # 🔥 НЕ КЛОНИРУЕМ, используем оригиналы
             prev_vecs.append(self.centroids[prev].detach())
-            
-            # 🔥 СОЗДАЁМ embedding напрямую
             prev_embeds.append(self.slot_embeddings.weight[prev].detach())
-            
             target_slots.append(nxt)
         
-        # Стеки и нормализация
         X = torch.stack(prev_vecs)
         
-        # 📊 ПРОВЕРКА ДИАПАЗОНА ВХОДНЫХ ДАННЫХ
         if torch.isnan(X).any() or torch.isinf(X).any():
             logger.warning("⚠ NaN в X, пропускаем батч")
             return None
@@ -715,18 +645,16 @@ class CentroidMemoryManager(nn.Module):
             logger.warning("⚠ Нулевые векторы в X, пропускаем")
             return None
         
-        X = F.normalize(X, dim=-1, eps=1e-8)  # ← добавил eps
+        X = F.normalize(X, dim=-1, eps=1e-8)
         
         E = torch.stack(prev_embeds)
-        E = F.normalize(E, dim=-1, eps=1e-8)  # ← добавил нормализацию эмбеддингов
+        E = F.normalize(E, dim=-1, eps=1e-8)
         
         y = torch.tensor(target_slots, device=device, dtype=torch.long)
         
-        # 🔥 УЛУЧШЕННЫЕ ВЕСА КЛАССОВ
+        # Улучшенные веса классов
         class_counts = torch.bincount(y, minlength=self.num_slots)
-        # Защита от деления на ноль
         class_weights = 1.0 / (class_counts.float().clamp(min=1.0))
-        # Нормализация весов
         class_weights = class_weights / class_weights.sum() * class_counts[class_counts > 0].numel()
         
         # Обучение
@@ -737,89 +665,66 @@ class CentroidMemoryManager(nn.Module):
         
         loss = F.cross_entropy(pred, y, weight=class_weights.to(device))
         
-        # 🔥 LOGIC-5: Добавляем repulsion loss
+        # Добавляем repulsion loss
         repulsion = self.compute_repulsion_loss(strength=0.001)
         loss = loss + repulsion
         
-        # 🔥🔥🔥 ИСПРАВЛЕНИЕ: Безопасная проверка loss перед backward
         loss_val = loss.item()
         
-        # Проверяем на NaN и бесконечность
         if math.isnan(loss_val) or math.isinf(loss_val):
             logger.error(f"❌ loss={loss_val}, пропускаю обновление (NaN/Inf)")
             return None
         
-        # Проверяем на слишком большое значение
         if loss_val > 10.0:
             logger.warning(f"⚠ Огромный loss={loss_val:.2f}, пропускаю обновление")
             return None
         
-        # Проверяем на отрицательное значение (не должно быть, но на всякий случай)
         if loss_val < 0.0:
             logger.warning(f"⚠ Отрицательный loss={loss_val:.2f}, пропускаю обновление")
             return None
         
         self.linker_optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.linker.parameters(), 0.5)  # ← уменьшил с 1.0 до 0.5
+        torch.nn.utils.clip_grad_norm_(self.linker.parameters(), 0.5)
         self.linker_optimizer.step()
         
         self.linker_updates += 1
         self.linker_losses.append(loss_val)
         
-        # ===========================================================
-        # ✅ Early stopping - сохраняем лучшую модель
-        # ===========================================================
-        if loss_val < self._best_linker_loss:
-            self._best_linker_loss = loss_val
-            self._best_linker_state = copy.deepcopy(self.linker.state_dict())
-            logger.debug(f"💾 Сохранена лучшая модель Linker: loss={loss_val:.4f}")
-        
-        # ===========================================================
-        # ✅ Шаг scheduler с логированием изменения LR
-        # ===========================================================
+        # Шаг scheduler
         if hasattr(self, 'linker_scheduler') and self.linker_scheduler is not None:
             old_lr = self.linker_optimizer.param_groups[0]['lr']
             self.linker_scheduler.step(loss_val)
             new_lr = self.linker_optimizer.param_groups[0]['lr']
             
-            # Логируем только когда LR меняется
             if abs(new_lr - old_lr) > 1e-6:
                 logger.info(f"📉 Learning rate уменьшен: {old_lr:.6f} → {new_lr:.6f}")
             
-            # Можно логировать текущий LR при каждом 10-м обновлении для отладки
             if self.linker_updates % 10 == 0:
                 logger.debug(f"📉 Текущий LR: {new_lr:.6f}")
         
         self.linker.eval()
         
-        # 🔥 ПРАВИЛЬНЫЙ РАСЧЕТ ТОЧНОСТИ
+        # Вычисление точности и обновление curiosity (ВЕКТОРИЗОВАННО)
         with torch.no_grad():
             pred_probs = F.softmax(pred, dim=-1)
             pred_labels = pred_probs.argmax(dim=1)
             
-            # Точность топ-1
             correct = (pred_labels == y).sum().item()
             accuracy_top1 = correct / len(y)
             
-            # Точность топ-3
             top3_pred = pred_probs.topk(3, dim=1).indices
             correct_top3 = (top3_pred == y.unsqueeze(-1)).any(dim=1).float().mean().item()
             
-            # Средняя уверенность в правильном ответе
             confidence_in_correct = pred_probs[torch.arange(len(y)), y].mean().item()
-            
-            # Энтропия предсказаний
             entropy = -(pred_probs * torch.log(pred_probs + 1e-10)).sum(dim=1).mean().item()
             
-            # 🔥 Обновляем curiosity на основе ошибок
-            for i, (pred_label, true) in enumerate(zip(pred_labels, y)):
-                if pred_label != true:
-                    self.update_curiosity(
-                        pred_label.item(), 
-                        true.item(), 
-                        pred_probs[i, true].item()
-                    )
+            # 🔥 ВЕКТОРИЗОВАННОЕ обновление curiosity
+            errors = (pred_labels != y)
+            if errors.any():
+                error_slots = y[errors]
+                error_confs = pred_probs[errors, y[errors]]
+                self.slot_curiosity[error_slots] += (1.0 - error_confs)
         
         # Логгирование
         if self.linker_updates == 1:
@@ -833,7 +738,6 @@ class CentroidMemoryManager(nn.Module):
             logger.info(f"   📊 Метрики: топ-1={accuracy_top1:.2%}, топ-3={correct_top3:.2%}, "
                         f"уверенность={confidence_in_correct:.3f}, энтропия={entropy:.3f}")
             
-            # Логируем распределение батча
             unique_targets = len(set(target_slots))
             most_common = max(set(target_slots), key=target_slots.count) if target_slots else "None"
             logger.info(f"   Батч: {unique_targets} уникальных target, "
@@ -1892,13 +1796,6 @@ class CentroidMemoryManager(nn.Module):
                 # Сохраняем веса Linker
                 state['linker_state'] = self.linker.state_dict()
                 
-                # ===========================================================
-                # ✅ Сохраняем best model
-                # ===========================================================
-                if hasattr(self, '_best_linker_state') and self._best_linker_state is not None:
-                    state['_best_linker_state'] = self._best_linker_state
-                    state['_best_linker_loss'] = self._best_linker_loss
-                    logger.debug(f"💾 Сохранена лучшая модель Linker с loss={self._best_linker_loss:.4f}")
                 
                 # ===========================================================
                 # 🔧 Сохраняем глубокую копию состояния оптимизатора
@@ -1927,8 +1824,7 @@ class CentroidMemoryManager(nn.Module):
                         logger.warning(f"⚠ Ошибка сохранения scheduler'а: {e}")
                 
                 logger.info(f"🧠 Linker сохранён: обновлений={state['linker_updates']}, "
-                           f"история={len(state['transition_history'])}, "
-                           f"best_loss={getattr(self, '_best_linker_loss', 'N/A')}")
+                           f"история={len(state['transition_history'])}, ")
                 
             except Exception as e:
                 logger.warning(f"⚠ Ошибка сохранения Linker: {e}")
@@ -2028,13 +1924,6 @@ class CentroidMemoryManager(nn.Module):
             if 'linker_train_frequency' in state:
                 self.linker_train_frequency = state['linker_train_frequency']
             
-            # 🔥 Загружаем best model, если есть
-            if '_best_linker_state' in state:
-                self._best_linker_state = state['_best_linker_state']
-            if '_best_linker_loss' in state:
-                self._best_linker_loss = state['_best_linker_loss']
-            else:
-                self._best_linker_loss = float('inf')
         
         # ===========================================================
         # 🔥 ЗАГРУЗКА LINKER И ОПТИМИЗАТОРА
@@ -2054,11 +1943,6 @@ class CentroidMemoryManager(nn.Module):
                 self.linker = self.linker.to(self.device)
                 self.linker.eval()
                 
-                # ✅ LINKER-3: Загружаем best model
-                if '_best_linker_state' in state:
-                    self._best_linker_state = state['_best_linker_state']
-                    self._best_linker_loss = state['_best_linker_loss']
-                    logger.info(f"💾 Лучшая модель Linker сохранена с loss={self._best_linker_loss:.4f}")
                 
                 # ===========================================================
                 # 🔥🔥🔥 ВАЖНО: СНАЧАЛА создаём оптимизатор, если его нет
@@ -2253,19 +2137,3 @@ class CentroidMemoryManager(nn.Module):
         
         logger.info(f"✅ Оптимизатор linker'а создан на {device} (lr={old_lr}, wd={old_wd})")
         
-    def restore_best_linker(self):
-        """Восстанавливает лучшую сохранённую модель Linker - ИСПРАВЛЕНО 2025"""
-        if hasattr(self, '_best_linker_state') and self._best_linker_state is not None:
-            # 🔥 ИСПРАВЛЕНИЕ 4: проверяем устройство
-            device = self.centroids.device
-            best_state = self._best_linker_state
-            
-            # Перемещаем на правильное устройство
-            for key in best_state:
-                if isinstance(best_state[key], torch.Tensor):
-                    best_state[key] = best_state[key].to(device)
-            
-            self.linker.load_state_dict(best_state)
-            logger.info(f"🔄 Восстановлена лучшая модель Linker с loss={self._best_linker_loss:.4f}")
-            return True
-        return False
