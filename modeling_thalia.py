@@ -36,47 +36,21 @@ logger = logging.getLogger(__name__)
 # ===================================================================
 # 🧠 TEMPORAL HEBBIAN PATTERN LAYER - МЕТА-ПЛАСТИЧНОСТЬ v5.4
 # ===================================================================
-# CHANGELOG v5.3 (жизненный цикл слотов + умное управление ёмкостью):
-# 🔴 FIX-1: Атомарная проверка в _consolidate_new_slot (защита от дублирования)
-# 🔴 FIX-2: Гарантированная очистка аккумуляторов после создания слота
-# 🔴 FIX-3: Utility ceiling 0.95 + штраф доминантам
-# 🔴 FIX-4: Фиксация n_init в _accum_pending_snapshot
-# 🔴 FIX-5: Безопасное обновление initialized_slots в _create_slot
-# 🟡 FIX-6: Защита новых слотов от decay при slot_age < 1000
-# 🔥 ARCH-1: Накопление ТОЛЬКО для ACTIVE слотов
-# 🔥 ARCH-2: Min steps для нового слота (эпизодическая консолидация)
-# 🔥 ARCH-3: Utility растёт от write_gate (важность, а не частота)
-# 🔥 ARCH-4: STDP только для ACTIVE→ACTIVE переходов
-# 🔥 ARCH-5: Attention читает только из ACTIVE слотов
-# 🆕 v5.3-ARCH-6: Слоты НЕ умирают, пока initialized < num_slots
-# 🆕 v5.3-ARCH-7: CANDIDATE и эвикшн только при полной ёмкости (64 слота)
-# 🆕 v5.3-ARCH-8: При полной ёмкости: слияние → усиление → только потом эвикшн
-# 🆕 v5.3-ARCH-9: Diversity bonus для редких слотов
-# 🛠 v5.3.9: ИСПРАВЛЕНИЕ КОЛЛАПСА СЛОТОВ
-# • Антиколлапс: при доминировании одного слота (>70% sim) усиливаем второй
-# • Защита от усиления слота с utility=0.95 (потолок)
-# • Правильная инициализация slot_age = 0 (не номер шага!)
-# • Аккумуляторы очищаются только после успешного создания слота
-# • Реализован fill_threshold_for_creation (90% заполнения → приоритет усилению)
-# Концепция: Hebb = долговременная библиотека прототипов
-# ===================================================================
 class TemporalHebbLayer(nn.Module):
     """
-    Параллельное концептуальное пространство для одного блока трансформера.
-   
+    Параллельное концептуальное пространство для одного блока трансформера.  
     ЖИЗНЕННЫЙ ЦИКЛ СЛОТА v5.4:
     EMPTY → ACTIVE (при создании)
     ACTIVE (даже с utility=0.01) → остаётся ACTIVE пока есть свободные слоты
     ACTIVE → CANDIDATE только если n_init == num_slots И utility < threshold
     CANDIDATE → ACTIVE (если utility восстановилась)
     CANDIDATE → EMPTY только после grace period И при полной ёмкости
-   
     v5.3: Слоты "спят" вместо смерти пока есть свободное место.
     """
     SLOT_EMPTY = 0
     SLOT_CANDIDATE = 1
     SLOT_ACTIVE = 2
-   
+  
     def __init__(
         self,
         config,
@@ -105,62 +79,62 @@ class TemporalHebbLayer(nn.Module):
         self.candidate_grace_steps = candidate_grace_steps
         self.decay_interval_mult = decay_interval_mult
         self.new_slot_sim_threshold = new_slot_sim_threshold
-       
+      
         # ── Паттерны ──────────────────────────────────────────────
         self.register_buffer("patterns", torch.zeros(num_slots, self.dim))
         self.register_buffer("patterns_norm_cache", torch.zeros(num_slots, self.dim))
         self.register_buffer("patterns_norm_dirty", torch.tensor(True))
-       
+      
         # ── Аккумуляторы для существующих слотов ──────────────────
         self.register_buffer("accum_sum", torch.zeros(num_slots, self.dim))
         self.register_buffer("accum_weight", torch.zeros(num_slots))
-       
+      
         # ── Аккумуляторы для новых слотов ─────────────────────────
         self.register_buffer("new_slot_accum_sum", torch.zeros(self.dim))
         self.register_buffer("new_slot_accum_weight", torch.tensor(0.0))
         self.register_buffer("new_slot_steps", torch.tensor(0, dtype=torch.long))
-       
+      
         # 🔥 АККУМУЛЯТОР ДЛЯ "НЕПОХОЖЕГО" (v5-FIX-H)
         self.register_buffer("new_slot_accum_sum_residual", torch.zeros(self.dim))
         self.register_buffer("new_slot_accum_weight_residual", torch.tensor(0.0))
         self.register_buffer("new_slot_steps_residual", torch.tensor(0, dtype=torch.long))
-       
+      
         # ── Статистика слотов ──────────────────────────────────────
         self.register_buffer("slot_age", torch.zeros(num_slots, dtype=torch.long))
         self.register_buffer("slot_last_used", torch.zeros(num_slots, dtype=torch.long))
         self.register_buffer("slot_usage_count", torch.zeros(num_slots))
         self.register_buffer("slot_utility", torch.zeros(num_slots))
-       
+      
         # ── Статус и счётчик кандидата ─────────────────────────────
         self.register_buffer("slot_status", torch.zeros(num_slots, dtype=torch.long))
         self.register_buffer("slot_candidate_since", torch.zeros(num_slots, dtype=torch.long))
-       
+      
         # ── STDP ───────────────────────────────────────────────────
         self.register_buffer("transition_matrix", torch.zeros(num_slots, num_slots))
         self.register_buffer("prev_best_idx", torch.zeros(4096, dtype=torch.long))
         self.register_buffer("prev_batch_size", torch.tensor(0, dtype=torch.long))
         self.register_buffer("prev_idx_valid", torch.tensor(False))
         self.register_buffer("prev_write_gate", torch.zeros(4096))
-       
+      
         # ── Инициализированные слоты ───────────────────────────────
         self.register_buffer("initialized_slots", torch.tensor(0, dtype=torch.long))
-       
+      
         # ── Счётчики ───────────────────────────────────────────────
         self.register_buffer("step_counter", torch.tensor(0, dtype=torch.long))
         self.register_buffer("total_updates", torch.tensor(0, dtype=torch.long))
         self.register_buffer("total_reads", torch.tensor(0, dtype=torch.long))
         self.register_buffer("_accum_pending_snapshot", torch.tensor(0, dtype=torch.long))
-       
+      
         # ── Заморозка / версионирование ───────────────────────────
         self.register_buffer("patterns_frozen", torch.tensor(False))
         self.register_buffer("_patterns_version", torch.tensor(0, dtype=torch.long))
-       
+      
         # ── Статистика для логов ───────────────────────────────────
         self.register_buffer("_last_active_slots", torch.tensor(0, dtype=torch.long))
         self.register_buffer("new_slot_created_this_step", torch.tensor(0, dtype=torch.long))
         self.register_buffer("last_surprise_used", torch.tensor(0.0))
         self.register_buffer("_last_hebb_query", torch.zeros(self.dim))
-       
+      
         # ── Aux loss буферы ────────────────────────────────────────
         self.register_buffer("aux_loss", torch.tensor(0.0, dtype=torch.float32))
         self.register_buffer("_aux_loss_counter", torch.tensor(0, dtype=torch.long))
@@ -168,14 +142,18 @@ class TemporalHebbLayer(nn.Module):
         _cl.add_(1e-12); _cl.sub_(1e-12)
         self.register_buffer("_controller_loss", _cl)
         self.register_buffer("_controller_loss_for_backward", torch.tensor(0.0, dtype=torch.float32))
-       
+      
         self._dynamic_tied_weights_keys = ["aux_loss", "*controller_loss"]
-       
+      
         # ── Счётчик доминирования ────────────────────────────
         self.register_buffer("_dominant_share_ema", torch.tensor(0.0))
         self._last_consolidation_step = 0
         self.register_buffer("_last_decay_step", torch.tensor(0, dtype=torch.long))
-       
+      
+        # 🔥 FIX: Очищаем кэш пар при дефрагментации
+        self._last_merged_pairs = set()
+        self._merge_cooldown_step = 0
+      
         # ========== ОБУЧАЕМЫЕ ЧАСТИ ==========
         self.query_norm_ctrl = nn.LayerNorm(self.dim)
         ctrl_dim = self.dim * 2 + 3
@@ -192,64 +170,64 @@ class TemporalHebbLayer(nn.Module):
         nn.init.eye_(self.read_proj.weight)
         self.temperature_logit = nn.Parameter(torch.tensor(0.0))
         self.memory_scale = nn.Parameter(torch.tensor(0.1))
-       
+      
         # ========== ГИПЕРПАРАМЕТРЫ ==========
         self.merge_threshold = 0.95
         self.decay_factor = 0.9995
         self.decay_factor_new = 0.9999
         self.stdp_lr = 0.02
         self.accum_min_weight = 0.005
-       
+      
         # 🔴 v5.2: Потолок utility
         self.utility_ceiling = 0.95
-       
+      
         # 🔥 v5.2-ARCH-2: Минимум шагов для создания нового слота
         self.min_steps_for_new_slot = 3
-       
+      
         # 🆕 v5.3: Управление ёмкостью
         self.aggressive_merge_threshold = 0.88
         self.strengthen_sim_threshold = 0.92
         self.evict_only_if_novel_threshold = 0.75
-       
+      
         # v5.3.4: Приоритет "приткнуться"
         self.attach_threshold = 0.88 # если sim выше — всегда усиливаем
         self.merge_if_above = 0.78 # если между 0.78 и 0.88 — пытаемся слить
         self.evict_only_if = 0.68 # только тогда убиваем
-       
+      
         # 🆕 v5.3.2: ИММУНИТЕТ ПО АССОЦИАЦИЯМ (защита связанных слотов)
         self.register_buffer("_association_immunity", torch.zeros(num_slots))
         self.immunity_decay = 0.95
         self.immunity_boost = 0.1
         self.association_weight = nn.Parameter(torch.tensor(0.3))
-       
+      
         # v5.3.2: бонус от связей
         self.link_bonus_scale = 0.015 # основной множитель
         self.link_bonus_max = 0.08 # потолок бонуса за один consolidate
         self.link_bonus_decay = 0.992 # лёгкий decay старых связей при расчёте
-       
+      
         # v5.3.6: Долговременная память — порог перехода к "усилению"
-        self.fill_threshold_for_creation = 0.90 # когда заполнено > 80% — перестаём активно создавать новые слоты
-        
-    # ================================================================
-    # FORWARD
-    # ================================================================
+        self.fill_threshold_for_creation = 0.90 # когда заполнено > 90% — перестаём активно создавать новые слоты
+       
+# ================================================================
+# FORWARD
+# ================================================================
     def forward(self, hidden_states, attention_mask=None, signals=None,
-                    surprise=0.0, target_signals=None, **kwargs):
+                        surprise=0.0, target_signals=None, **kwargs):
         if self._is_meta():
             return hidden_states, self.aux_loss
-           
+          
         if hidden_states.dim() == 2:
             hidden_states = hidden_states.unsqueeze(1)
             was_2d = True
         else:
             was_2d = False
-           
+          
         b, s, d = hidden_states.shape
         device = hidden_states.device
-       
+      
         self.step_counter.add_(1)
         self._aux_loss_counter.add_(1)
-       
+      
         # ── Распаковка signals ────────────────────────────────────
         if signals is None:
             signals = {}
@@ -257,49 +235,54 @@ class TemporalHebbLayer(nn.Module):
             signals['surprise'] = surprise
         if target_signals is not None and 'target_signals' in signals:
             signals['target_signals'] = target_signals
-            
+           
         # Сохраняем заполненность группы (если нет, считаем по себе как фоллбэк)
-        self._temp_group_fill = signals.get('group_fill_ratio', 
+        self._temp_group_fill = signals.get('group_fill_ratio',
                                            int(self.initialized_slots.item()) / self.num_slots)
         self._temp_group_id = signals.get('group_id', 0)
-           
+          
         if 'surprise' in signals:
             sv = signals['surprise']
             surprise_val = float(sv.mean().item() if isinstance(sv, torch.Tensor) else sv)
         else:
             surprise_val = float(surprise) if isinstance(surprise, (int, float)) else 0.0
-       
+      
         # ── Защита от NaN/Inf ─────────────────────────────────────
         if torch.isnan(hidden_states).any() or torch.isinf(hidden_states).any():
             return (hidden_states.squeeze(1) if was_2d else hidden_states), self.aux_loss
-       
+      
         # ========== 1. QUERY (УЛУЧШЕННЫЙ ANTI-MUSH) ==========
         # ANTI-MUSH: На длинных текстах выбираем случайное "окно внимания"
         if s > 64 and self.training:
             window_size = 64
-            # Используем torch.randint для GPU-совместимости
             start_idx = torch.randint(0, max(1, s - window_size), (1,), device=device).item()
             focal_states = hidden_states[:, start_idx : start_idx + window_size, :]
-            
+           
             if attention_mask is not None:
                 mask_chunk = attention_mask[:, start_idx : start_idx + window_size].unsqueeze(-1).float()
-                query_vec = (focal_states * mask_chunk).sum(dim=1) / mask_chunk.sum(dim=1).clamp(min=1e-8)
+                query_vec = (focal_states * mask_chunk).max(dim=1)[0]
             else:
-                query_vec = focal_states.mean(dim=1)
+                query_vec = focal_states.max(dim=1)[0]
+            
+            if query_vec.requires_grad:
+                query_vec.register_hook(lambda grad: grad / window_size)
         else:
-            # Короткие тексты (или инференс) - обычное среднее
             if attention_mask is not None:
                 if attention_mask.dim() == 2 and attention_mask.shape[1] != s and s == 1:
                     attention_mask = attention_mask[:, :1]
                 mask = attention_mask.unsqueeze(-1).float()
-                query_vec = (hidden_states * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-8)
+                query_vec = (hidden_states * mask).max(dim=1)[0]
             else:
-                query_vec = hidden_states.mean(dim=1)
-       
+                query_vec = hidden_states.max(dim=1)[0]
+            
+            if query_vec.requires_grad and s > 1:
+                query_vec.register_hook(lambda grad: grad / s)
+
+        # Нормализация query
         query_vec = torch.nan_to_num(query_vec, 0.0)
         query_for_search = F.normalize(query_vec.detach(), dim=-1)
         query_for_ctrl = self.query_norm_ctrl(query_vec)
-       
+      
         # ========== 2. Нет инициализированных слотов ==========
         n_init = int(self.initialized_slots.item())
         if n_init == 0:
@@ -313,62 +296,64 @@ class TemporalHebbLayer(nn.Module):
                     self.total_reads.add_(b * s)
                 self._maybe_consolidate()
             return (hidden_states.squeeze(1) if was_2d else hidden_states), self.aux_loss
-       
+      
         # ========== 3. ARCH-5: ATTENTION ТОЛЬКО ПО ACTIVE СЛОТАМ ==========
         slot_active = (self.slot_status[:n_init] == self.SLOT_ACTIVE)
         n_active = int(slot_active.sum().item())
-       
+      
         if n_active == 0:
             with torch.no_grad():
                 self.total_reads.add_(b * s)
             self._maybe_consolidate()
             return (hidden_states.squeeze(1) if was_2d else hidden_states), self.aux_loss
-       
+      
         patterns_norm = self._get_patterns_norm()[:n_init]
         similarity = torch.matmul(query_for_search, patterns_norm.T)
-       
+      
         NEG_INF = -30000.0
         if not slot_active.all():
             similarity = similarity.masked_fill(
                 (~slot_active).unsqueeze(0), NEG_INF
             )
-       
-        # Температура с модуляцией surprise
+      
+        # ===========================================================
+        # 🔥 Динамическая температура с учётом surprise
+        # ===========================================================
         temperature = self._get_temperature()
         if not isinstance(temperature, torch.Tensor):
             temperature = torch.tensor(temperature, device=device)
         else:
             temperature = temperature.clone()
-           
+          
         if surprise_val != 0.0:
             temperature = temperature * (1.0 + surprise_val * 1.5)
         temperature = torch.clamp(temperature, 0.5, 8.0)
-       
+      
         similarity = torch.nan_to_num(similarity, nan=0.0, posinf=10.0, neginf=-10.0)
         scaled_sim = similarity / temperature.clamp(min=1e-8)
         attn_weights = F.softmax(scaled_sim, dim=-1)
-       
+      
         active_patterns = self.patterns[:n_init].detach()
         combined = torch.matmul(attn_weights, active_patterns)
-       
+      
         # ========== 4. TOP-1 для статистики ==========
         with torch.no_grad():
             valid_sim = similarity.clone()
             valid_sim[valid_sim < -1000] = -1.0
             best_sim, best_idx = valid_sim.max(dim=-1)
             novelty = (1.0 - best_sim).clamp(0.0, 1.0)
-           
+          
             if surprise_val != 0.0:
                 novelty = novelty * 0.7 + surprise_val * 0.3
-           
+          
             dominant_idx = best_idx.mode().values.item()
             dominant_share = float((best_idx == dominant_idx).float().mean().item())
             self._dominant_share_ema.mul_(0.95).add_(dominant_share * 0.05)
-       
+      
         # ========== 5. CONTROLLER ==========
         max_usage = self.slot_usage_count[:n_init].max().clamp(min=1.0)
         usage_norm = (self.slot_usage_count[best_idx] / max_usage).detach()
-       
+      
         ctrl_input = torch.cat([
             query_for_ctrl,
             self.patterns[best_idx].detach(),
@@ -376,41 +361,47 @@ class TemporalHebbLayer(nn.Module):
             usage_norm.unsqueeze(-1).detach(),
             novelty.unsqueeze(-1).detach(),
         ], dim=-1)
-       
+      
         ctrl_input = self.ctrl_norm(ctrl_input).clamp(-5.0, 5.0)
         ctrl_out = self.controller(ctrl_input)
         read_gate = torch.sigmoid(ctrl_out[:, 0:1])
         write_gate = torch.sigmoid(ctrl_out[:, 1:2])
-       
+      
         if 'target_signals' in signals and signals['target_signals'] is not None:
             tgt = signals['target_signals']
             if isinstance(tgt, dict) and 'write_gate' in tgt:
                 tw = torch.tensor(tgt['write_gate'], device=device).expand_as(write_gate)
                 write_gate = write_gate * 0.9 + tw * 0.1
-       
+      
         # ========== 6. ЧТЕНИЕ ==========
         memory = self.read_proj(combined)
-        scale = self.memory_scale.clamp(0.0, 0.5)
+        
+        # ===========================================================
+        # 🔥 Динамический масштаб памяти с учётом surprise
+        # ===========================================================
+        base_scale = self.memory_scale.clamp(0.0, 0.5)
+        scale = torch.clamp(base_scale * (1.0 + surprise_val), 0.0, 0.7)
+        
         output = hidden_states + read_gate.unsqueeze(1) * memory.unsqueeze(1) * scale
-       
+      
         # ========== 7. НАКОПЛЕНИЕ (ИСПРАВЛЕНО: используем query_vec вместо hidden_states) ==========
         if not self.patterns_frozen.item():
             # 7a. Передаем острый query_vec вместо размазанного hidden_states
             self._accumulate_weighted(
-                query_vec.detach(),  # <--- ИЗМЕНЕНИЕ: используем query_vec
+                query_vec.detach(), # <--- ИЗМЕНЕНИЕ: используем query_vec
                 attn_weights=attn_weights.detach(),
                 write_gate=write_gate.detach(),
                 n_init=n_init,
             )
-           
+          
             # 7b. Передаем острый query_vec
             self._accumulate_new_slot(
-                query_vec.detach(),  # <--- ИЗМЕНЕНИЕ: используем query_vec
+                query_vec.detach(), # <--- ИЗМЕНЕНИЕ: используем query_vec
                 novelty,
                 write_gate.detach(),
                 patterns_norm if n_init > 0 else None
             )
-           
+          
             # Фиксация n_init для снапшота
             with torch.no_grad():
                 n_init_fixed = int(self.initialized_slots.item())
@@ -418,20 +409,20 @@ class TemporalHebbLayer(nn.Module):
                 new_pend_main = 1 if self.new_slot_accum_weight.item() > 0 else 0
                 new_pend_res = 1 if self.new_slot_accum_weight_residual.item() > 0 else 0
                 self._accum_pending_snapshot.fill_(pending + new_pend_main + new_pend_res)
-       
+      
         # ========== 8. СТАТИСТИКА + STDP ==========
         with torch.no_grad():
             self.slot_usage_count[best_idx] += 1.0
             self.slot_last_used[best_idx] = self.step_counter
             self.slot_age[best_idx] += 1
             self.total_reads.add_(b * s)
-           
+          
             # ARCH-3: Utility растёт от write_gate (важность)
             for bi in range(b):
                 idx = best_idx[bi].item()
                 st = int(self.slot_status[idx])
                 wg = float(write_gate[bi].item())
-               
+              
                 if st == self.SLOT_ACTIVE:
                     self.slot_utility[idx] = min(
                         self.utility_ceiling,
@@ -442,16 +433,16 @@ class TemporalHebbLayer(nn.Module):
                     self.slot_utility[idx] = min(self.utility_ceiling, new_util)
                     if self.slot_utility[idx] >= self.candidate_threshold:
                         self.slot_status[idx] = self.SLOT_ACTIVE
-           
+          
             # ARCH-4: STDP только для ACTIVE→ACTIVE
             if not self.patterns_frozen.item():
                 self._update_stdp(best_idx, write_gate)
-           
+          
             active = (self.slot_status[:n_init] == self.SLOT_ACTIVE).sum()
             self._last_active_slots.fill_(active.item())
             self._last_hebb_query = query_for_search.mean(dim=0)
             self.last_surprise_used = torch.tensor(surprise_val, device=device)
-       
+      
         # ========== 9. AUX LOSS ==========
         if self.training:
             attn_entropy = -(attn_weights * torch.log(attn_weights + 1e-8)).sum(dim=-1).mean()
@@ -460,42 +451,46 @@ class TemporalHebbLayer(nn.Module):
             wg_mean = write_gate.mean()
             gate_reg = ((rg_mean - 0.5)**2 + (wg_mean - 0.5)**2) * 0.1
             total_aux = torch.clamp(entropy_loss + gate_reg, 0.0, 5.0)
-            self.aux_loss = total_aux
+            
+            # Регистрируем aux_loss в градиентном графе
+            if total_aux.requires_grad:
+                self.aux_loss = total_aux + 0.0
+            else:
+                self.aux_loss = total_aux
         else:
-            self.aux_loss = torch.tensor(0.0, device=device)
-       
+            self.aux_loss = torch.tensor(0.0, device=device, requires_grad=False)
+      
         # ========== 10. КОНСОЛИДАЦИЯ ==========
         self._maybe_consolidate()
-       
+      
         return (output.squeeze(1) if was_2d else output), self.aux_loss
-        
-    # ================================================================
-    # КОНСОЛИДАЦИЯ
-    # ================================================================
+       
+# ================================================================
+# КОНСОЛИДАЦИЯ
+# ================================================================
     def _maybe_consolidate(self):
         if self.patterns_frozen.item():
             return
-           
+          
         step = int(self.step_counter.item())
-       
+      
         if not hasattr(self, '_last_consolidation_step'):
             self._last_consolidation_step = 0
         if not hasattr(self, '_last_decay_step'):
             self.register_buffer("_last_decay_step", torch.tensor(0, dtype=torch.long))
-       
+      
         # Консолидация
         if step - self._last_consolidation_step >= self.consolidation_interval:
             with torch.no_grad():
                 self._consolidate()
                 self._consolidate_new_slot()
                 #self._merge_similar()
-
             self._last_consolidation_step = step
-       
+      
         # Decay
         decay_interval = self.consolidation_interval * self.decay_interval_mult
         steps_since_decay = step - self._last_decay_step.item()
-       
+      
         if steps_since_decay >= decay_interval:
             times = steps_since_decay // decay_interval
             with torch.no_grad():
@@ -504,43 +499,43 @@ class TemporalHebbLayer(nn.Module):
                     self._mark_candidates()
                     self._replace_expired()
             self._last_decay_step.add_(times * decay_interval)
-        
-    # ================================================================
-    # ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ
-    # ================================================================
+       
+# ================================================================
+# ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ
+# ================================================================
     @torch.no_grad()
     def _accumulate_weighted(self, query_vec, attn_weights, write_gate, n_init):
         """🔥 ARCH-1: Накопление ТОЛЬКО для ACTIVE слотов"""
         if n_init == 0:
             return
-       
+      
         active_mask = (self.slot_status[:n_init] == self.SLOT_ACTIVE)
         if not active_mask.any():
             return
-       
+      
         weights = attn_weights * write_gate
         weights = weights * active_mask.unsqueeze(0).float()
-       
+      
         # query_vec уже плоский [b, d], умножаем напрямую
-        contrib = torch.matmul(weights.T, query_vec) 
+        contrib = torch.matmul(weights.T, query_vec)
         w_sum = weights.sum(dim=0)
-        
+       
         self.accum_sum[:n_init].add_(contrib)
         self.accum_weight[:n_init].add_(w_sum)
-   
+  
     @torch.no_grad()
     def _accumulate_new_slot(self, query_vec, novelty, write_gate, patterns_norm):
         """
         Накопление для новых слотов с использованием плоского query_vec.
-        
+       
         Args:
             query_vec: [batch, dim] - уже сконденсированное представление (результат anti-mush)
             novelty: [batch] - степень новизны для каждого элемента батча
             write_gate: [batch, 1] - гейт записи
             patterns_norm: [n_init, dim] - нормализованные существующие паттерны
         """
-        b, d = query_vec.shape  # Убрали 's' (seq_len), вектор уже плоский
-        
+        b, d = query_vec.shape # Убрали 's' (seq_len), вектор уже плоский
+       
         # ===== БАЗОВЫЙ ПОРОГ ОТ ЗАПОЛНЕННОСТИ =====
         filled_ratio = self.initialized_slots.item() / self.num_slots
         if filled_ratio < 0.1:
@@ -551,58 +546,58 @@ class TemporalHebbLayer(nn.Module):
             base_threshold = 0.18
         else:
             base_threshold = 0.20
-        
+       
         # ===== МОДИФИКАТОР ОТ ГЛУБИНЫ СЛОЯ =====
         depth_mod = 1.0
         if self.layer_idx is not None and self.layer_idx != "?" and self.total_layers:
             layer_id = int(self.layer_idx)
             n_layers = self.total_layers if self.total_layers else (layer_id + 1)
-            depth_ratio = layer_id / max(n_layers - 1, 1)  # 0.0 (нижний) → 1.0 (верхний)
-            
+            depth_ratio = layer_id / max(n_layers - 1, 1) # 0.0 (нижний) → 1.0 (верхний)
+           
             # Нижние слои (синтаксис) - порог чуть ниже (легче создавать)
             # Верхние слои (абстракции) - порог чуть выше (строже)
-            depth_mod = 0.9 + depth_ratio * 0.2  # от 0.9 до 1.1
-        
+            depth_mod = 0.9 + depth_ratio * 0.2 # от 0.9 до 1.1
+       
         # ===== КОМБИНИРОВАННЫЙ ПОРОГ =====
         novelty_threshold = base_threshold * depth_mod
-        
+       
         # Дополнительная модуляция от write_gate (важность)
         if write_gate is not None and write_gate.numel() > 0:
             wg_mean = write_gate.mean().item()
             if wg_mean > 0.3:
-                novelty_threshold *= (1.0 - wg_mean * 0.3)  # Высокий write_gate = легче создавать
-        
+                novelty_threshold *= (1.0 - wg_mean * 0.3) # Высокий write_gate = легче создавать
+       
         # Дополнительная модуляция от surprise (если высокое удивление - легче создавать)
         if hasattr(self, 'last_surprise_used') and self.last_surprise_used.item() > 0.3:
             surprise_mod = max(0.7, 1.0 - self.last_surprise_used.item() * 0.3)
             novelty_threshold *= surprise_mod
-        
+       
         # Финальное ограничение
         novelty_threshold = max(0.05, min(0.25, novelty_threshold))
-        
+       
         # ===== ОПРЕДЕЛЯЕМ КАНДИДАТОВ =====
         is_candidate = novelty >= novelty_threshold
-        
+       
         if not is_candidate.any():
             return
-            
+           
         n_init = self.initialized_slots.item()
-        
+       
         # Берем кандидатов прямо из плоского query_vec
-        cand_states = query_vec[is_candidate]  # shape: [num_candidates, d]
+        cand_states = query_vec[is_candidate] # shape: [num_candidates, d]
         cand_norm = F.normalize(cand_states, dim=-1)
-        
+       
         if n_init > 0 and patterns_norm is not None:
             sim_to_all = torch.matmul(cand_norm, patterns_norm.T)
             max_sim, closest_slot = sim_to_all.max(dim=-1)
-            
+           
             similar_mask = max_sim > self.new_slot_sim_threshold
             novel_mask = ~similar_mask
-            
+           
             if similar_mask.any():
                 similar_states = cand_states[similar_mask]
-                n_tok_sim = similar_mask.sum().item()  # Убрали умножение на s
-                
+                n_tok_sim = similar_mask.sum().item() # Убрали умножение на s
+               
                 for idx in torch.unique(closest_slot[similar_mask]):
                     slot_mask = (closest_slot == idx) & similar_mask
                     if slot_mask.any():
@@ -610,16 +605,16 @@ class TemporalHebbLayer(nn.Module):
                         # sum вместо mean, так как у нас уже плоские векторы
                         self.accum_sum[idx].add_(slot_states.sum(dim=0))
                         self.accum_weight[idx].add_(float(slot_mask.sum().item()))
-            
+           
             if novel_mask.any():
                 novel_states = cand_states[novel_mask]
-                n_tok_novel = novel_mask.sum().item()  # Убрали умножение на s
-                
+                n_tok_novel = novel_mask.sum().item() # Убрали умножение на s
+               
                 # residual — для по-настоящему новых
                 self.new_slot_accum_sum_residual.add_(novel_states.sum(dim=0))
                 self.new_slot_accum_weight_residual.add_(float(n_tok_novel))
                 self.new_slot_steps_residual.add_(1)
-                
+               
                 # main — для всего novel
                 self.new_slot_accum_sum.add_(novel_states.sum(dim=0))
                 self.new_slot_accum_weight.add_(float(n_tok_novel))
@@ -629,32 +624,32 @@ class TemporalHebbLayer(nn.Module):
             self.new_slot_accum_sum.add_(cand_states.sum(dim=0))
             self.new_slot_accum_weight.add_(float(cand_states.shape[0]))
             self.new_slot_steps.add_(1)
-   
+  
     @torch.no_grad()
     def _consolidate(self):
         """🆕 v5.3: Выравнивание utility всегда + diversity bonus"""
         if torch.is_grad_enabled():
             logger.warning(f"⚠ HebbLayer[{self.layer_idx}]: _consolidate с градиентами — пропуск")
             return
-           
+          
         n_init = int(self.initialized_slots.item())
         if n_init == 0:
             self.accum_sum.zero_()
             self.accum_weight.zero_()
             return
-       
+      
         # === v5.3: ВЫРАВНИВАНИЕ UTILITY ВСЕГДА ===
         self._entropy_align_utilities()
-       
+      
         active_mask = self.accum_weight[:n_init] > self.accum_min_weight
         if not active_mask.any():
             self.accum_sum.zero_()
             self.accum_weight.zero_()
             return
-       
+      
         total_usage = self.slot_usage_count[:n_init].sum().clamp(min=1.0)
         usage_share = self.slot_usage_count[:n_init] / total_usage
-       
+      
         updated = False
         for i in active_mask.nonzero(as_tuple=False).squeeze(-1).tolist():
             w = float(self.accum_weight[i])
@@ -663,46 +658,46 @@ class TemporalHebbLayer(nn.Module):
             new_emb = self.accum_sum[i] / w
             if new_emb.norm() < 1e-6:
                 continue
-               
+              
             new_emb_n = F.normalize(new_emb, dim=-1)
             importance = float(self.slot_utility[i])
-           
+          
             diversity_penalty = float(usage_share[i]) * 0.5
             lr = self.consolidation_lr * (0.5 + 0.5 * importance) * (1.0 - diversity_penalty)
             lr = max(lr, 0.005)
-           
+          
             updated_pat = (1.0 - lr) * self.patterns[i] + lr * new_emb_n
             self.patterns.data[i] = F.normalize(updated_pat, dim=-1)
-           
+          
             self.slot_utility[i] = min(self.utility_ceiling, float(self.slot_utility[i]) + 0.1)
-           
+          
             if self.slot_status[i] == self.SLOT_CANDIDATE \
                and self.slot_utility[i] >= self.candidate_threshold:
                 self.slot_status[i] = self.SLOT_ACTIVE
-           
+          
             self.total_updates.add_(1)
             updated = True
-       
+      
         # === v5.3: DIVERSITY BONUS для редких слотов ===
         if n_init > 3:
             utils = self.slot_utility[:n_init]
             usage = self.slot_usage_count[:n_init]
             rare_mask = (usage < usage.mean() * 0.3) & (utils > 0.05)
-           
+          
             if rare_mask.any():
                 # Правильный способ: создаём полноразмерный бонус
                 bonus = 0.03 * (1.0 - utils[rare_mask])
                 bonus_full = torch.zeros_like(utils)
                 bonus_full[rare_mask] = bonus
-               
+              
                 self.slot_utility[:n_init] = torch.clamp(
                     utils + bonus_full,
                     max=self.utility_ceiling
                 )
-       
+      
         if updated:
             self._patterns_version.add_(1)
-           
+          
         # === v5.3.2: бонус от связей ===
         self._apply_link_based_utility_bonus()
         self.accum_sum.zero_()
@@ -710,7 +705,7 @@ class TemporalHebbLayer(nn.Module):
         self.patterns_norm_dirty.fill_(True)
         # === v5.3.2: ИММУНИТЕТ ПО АССОЦИАЦИЯМ ===
         self._update_association_immunity()
-       
+      
     @torch.no_grad()
     def _entropy_align_utilities(self):
         """v5.3.4: Мягкое выравнивание (не убиваем utility)"""
@@ -719,21 +714,21 @@ class TemporalHebbLayer(nn.Module):
             return
         utils = self.slot_utility[:n_init].clone()
         mean_u = float(utils.mean())
-       
+      
         # Сильно слабее, чем было
         new_utils = utils * 0.94 + mean_u * 0.06
-       
+      
         self.slot_utility[:n_init] = new_utils
-   
+  
     @torch.no_grad()
     def _consolidate_new_slot(self):
-        """v5.4: Очистка ТОЛЬКО после успешного использования данных"""
+        """🔥 v5.4 FIX: Исправлен безусловный return после residual"""
         if torch.is_grad_enabled():
             return
-        
+       
         n_init = int(self.initialized_slots.item())
-        created_anything = False  # 🔥 Флаг успеха
-        
+        created_anything = False
+       
         # Residual (самые новые)
         w_res = float(self.new_slot_accum_weight_residual)
         steps_res = int(self.new_slot_steps_residual)
@@ -745,9 +740,10 @@ class TemporalHebbLayer(nn.Module):
                 if success:
                     self._clear_residual_accumulator()
                     created_anything = True
-                    # НЕ возвращаемся здесь, дадим шанс main-аккумулятору тоже
-                    return  # Ранний выход, если residual потребовал очистки, чтобы main не мешал
-        
+                    # ✅ Выходим ТОЛЬКО при успехе, иначе даём шанс main-аккумулятору
+                    return
+                # ❌ Если success=False, продолжаем к main аккумулятору!
+       
         # Main аккумулятор
         w_main = float(self.new_slot_accum_weight)
         steps_main = int(self.new_slot_steps)
@@ -759,86 +755,64 @@ class TemporalHebbLayer(nn.Module):
                 if success:
                     self._clear_main_accumulator()
                     created_anything = True
-        
+       
         # ✅ Очищаем ТОЛЬКО если прошли лимит шагов (старые данные сбрасываем)
         max_accum_steps = self.consolidation_interval * 20
         if int(self.new_slot_steps) > max_accum_steps:
             self._clear_main_accumulator()
         if int(self.new_slot_steps_residual) > max_accum_steps:
             self._clear_residual_accumulator()
-   
+  
     @torch.no_grad()
     def _try_create_or_strengthen(self, new_norm: torch.Tensor, is_residual: bool) -> bool:
-        """
-        v5.4.1: ПРИОРИТЕТЫ с учётом fill_threshold_for_creation (90%) + ГРУППЫ
-        """
         n_init = int(self.initialized_slots.item())
-        
-        # Берем заполненность группы (передана из Thalia.forward через signals)
+        has_space = n_init < self.num_slots
         group_fill_ratio = getattr(self, '_temp_group_fill', n_init / self.num_slots)
-        
-        # ── 1. РЕЖИМ СТАБИЛИЗАЦИИ (заполнено ≥ 80% по группе) ──
-        if group_fill_ratio >= self.fill_threshold_for_creation and n_init > 0:
-            active_idxs = (self.slot_status[:n_init] == self.SLOT_ACTIVE).nonzero(as_tuple=False).squeeze(-1)
+
+        # 🔥 Явный приоритет: физическое место важнее группового fill_ratio
+        if has_space:
+            logger.debug(f"🟢 HebbLayer[{self.layer_idx}]: есть место ({n_init}/{self.num_slots}), создаём/усиливаем")
             
-            if len(active_idxs) > 0:
-                active_pnorms = self._get_patterns_norm()[active_idxs]
-                sims = torch.matmul(new_norm.unsqueeze(0), active_pnorms.T).squeeze(0)
-                max_sim = float(sims.max().item())
-                closest_local = int(sims.argmax().item())
-                closest = int(active_idxs[closest_local].item())
-                
-                # 1a. Очень похоже → усиливаем ближайший слот
-                if max_sim > 0.85:
-                    self._strengthen_slot(closest, new_norm)
-                    logger.debug(
-                        f"🫂 HebbLayer[{self.layer_idx}]: усиление слота {closest} "
-                        f"(sim={max_sim:.3f}) [Группа {getattr(self, '_temp_group_id', '?')}: ≥80%]"
-                    )
+            # проверка на дубликат (даже если есть место)
+            if n_init > 0:
+                active_pnorms = self._get_patterns_norm()[:n_init]
+                sim = float(torch.matmul(new_norm.unsqueeze(0), active_pnorms.T).max().item())
+                # 🔥 ИСПРАВЛЕНИЕ: используем self.new_slot_sim_threshold вместо хардкода
+                if sim > self.new_slot_sim_threshold:
+                    # усиливаем ближайший
+                    self._strengthen_slot(int(torch.argmax(torch.matmul(new_norm.unsqueeze(0), active_pnorms.T)).item()), new_norm)
                     return True
-                
-                # 1b. Средне похоже → агрессивное слияние
-                if max_sim > 0.75:
-                    logger.debug(
-                        f"🔄 HebbLayer[{self.layer_idx}]: запуск слияния (sim={max_sim:.3f}) "
-                        f"[Группа {getattr(self, '_temp_group_id', '?')}: ≥80%]"
-                    )
-                    self._merge_similar_aggressive()
-                    return False  # Не чистим аккумуляторы! Они могут пригодиться позже
-            else:
-                logger.warning(f"⚠️ No active slots found despite n_init={n_init}")
-        
-        # ── 2. ЕСТЬ МЕСТО И (ГРУППА < 80% ИЛИ ПАТТЕРН УНИКАЛЬНЫЙ) ──
-        if n_init < self.num_slots:
-            # Дополнительная проверка уникальности даже при свободном месте
-            if group_fill_ratio >= self.fill_threshold_for_creation and n_init > 0:
-                active_idxs = (self.slot_status[:n_init] == self.SLOT_ACTIVE).nonzero(as_tuple=False).squeeze(-1)
-                if len(active_idxs) > 0:
-                    active_pnorms = self._get_patterns_norm()[active_idxs]
-                    sims = torch.matmul(new_norm.unsqueeze(0), active_pnorms.T).squeeze(0)
-                    max_sim = float(sims.max().item())
-                    
-                    if max_sim > 0.75:
-                        closest_local = int(sims.argmax().item())
-                        closest = int(active_idxs[closest_local].item())
-                        self._strengthen_slot(closest, new_norm)
-                        logger.debug(
-                            f"➕ HebbLayer[{self.layer_idx}]: усилили {closest} вместо создания "
-                            f"(sim={max_sim:.3f}) [≥80% режим]"
-                        )
-                        return True
             
-            # Создаём новый слот
             self._create_slot(new_norm)
             return True
+
+        # ── Места нет → только стабилизация ──
+        logger.debug(f"🔴 HebbLayer[{self.layer_idx}]: слоты заполнены ({n_init}/{self.num_slots}), режим стабилизации")
         
-        # ── 3. МЕСТ НЕТ И ПАТТЕРН ЧУЖОЙ ──
-        logger.debug(
-            f"⏳ HebbLayer[{self.layer_idx}]: паттерн отложен "
-            f"(fill_ratio={group_fill_ratio:.2f}, мест нет)"
-        )
+        active_idxs = (self.slot_status[:n_init] == self.SLOT_ACTIVE).nonzero(as_tuple=False).squeeze(-1)
+        if len(active_idxs) == 0:
+            return False
+
+        active_pnorms = self._get_patterns_norm()[active_idxs]
+        sims = torch.matmul(new_norm.unsqueeze(0), active_pnorms.T).squeeze(0)
+        max_sim = float(sims.max().item())
+
+        # 🔥 ИСПРАВЛЕНИЕ: используем self.strengthen_threshold вместо хардкода 0.85
+        strengthen_threshold = getattr(self, 'strengthen_threshold', 0.85)
+        if max_sim > strengthen_threshold:
+            closest = int(active_idxs[sims.argmax().item()].item())
+            self._strengthen_slot(closest, new_norm)
+            return True
+
+        # 🔥 ИСПРАВЛЕНИЕ: используем self.merge_threshold вместо хардкода 0.75
+        merge_threshold = getattr(self, 'merge_threshold', 0.75)
+        if max_sim > merge_threshold:
+            self._merge_similar_aggressive()
+            return False
+
+        # уникальный, но места нет → откладываем (не убиваем!)
         return False
-       
+      
     @torch.no_grad()
     def _merge_similar_aggressive(self):
         """🆕 v5.3: Агрессивное слияние при попытке добавить слот"""
@@ -846,21 +820,21 @@ class TemporalHebbLayer(nn.Module):
         self.merge_threshold = self.aggressive_merge_threshold
         self._merge_similar()
         self.merge_threshold = orig
-   
+  
     @torch.no_grad()
     def _strengthen_slot(self, idx: int, new_norm: torch.Tensor):
         """🆕 v5.3: Усиливаем существующий слот с защитой от переусиления"""
         # Если utility уже на потолке — не усиливаем (защита)
         if float(self.slot_utility[idx]) >= self.utility_ceiling - 0.01:
             return
-           
+          
         lr = 0.15 * (1.0 - float(self.slot_utility[idx]))
         updated = (1.0 - lr) * self.patterns[idx] + lr * new_norm
         self.patterns.data[idx] = F.normalize(updated, dim=-1)
         self.slot_utility[idx] = min(self.utility_ceiling, float(self.slot_utility[idx]) + 0.12)
         self._patterns_version.add_(1)
         self.patterns_norm_dirty.fill_(True)
-   
+  
     @torch.no_grad()
     def _evict_weakest(self, new_norm: torch.Tensor):
         """
@@ -912,87 +886,87 @@ class TemporalHebbLayer(nn.Module):
         n_after = int(self.initialized_slots.item())
         if n_after < self.num_slots:
             self._create_slot(new_norm)
-   
+  
     @torch.no_grad()
     def _apply_link_based_utility_bonus(self):
         """v5.3.2: Связи между слотами повышают utility связанных концептов"""
         n_init = int(self.initialized_slots.item())
         if n_init < 4:
             return # слишком мало слотов — пропускаем
-       
+      
         tm = self.transition_matrix[:n_init, :n_init].clone()
-       
+      
         # Лёгкий decay старых переходов (чтобы свежие связи были важнее)
         steps_since = int(self.step_counter.item() - self._last_consolidation_step)
         decay_exp = min(steps_since, 50) # защита от взрыва
         tm.mul_(self.link_bonus_decay ** decay_exp)
-       
+      
         # Исходящие + входящие связи (степень вершины в направленном графе)
         out_degree = tm.sum(dim=1) # сколько раз этот слот предшествовал другим
         in_degree = tm.sum(dim=0) # сколько раз другие предшествовали этому
         total_links = out_degree + in_degree
-       
+      
         # Нормализация (чтобы бонус был в разумных пределах)
         if total_links.sum() > 1e-6:
             norm_links = total_links / total_links.max().clamp(min=1e-6)
         else:
             norm_links = torch.zeros_like(total_links)
-       
+      
         # Бонус пропорционален связности
         bonus = norm_links * self.link_bonus_scale
         bonus = bonus.clamp(max=self.link_bonus_max)
-       
+      
         # Применяем только к ACTIVE слотам
         active_mask = (self.slot_status[:n_init] == self.SLOT_ACTIVE)
         bonus_full = torch.zeros_like(self.slot_utility[:n_init])
         bonus_full[active_mask] = bonus[active_mask] # ← если bonus тоже sliced
-       
+      
         self.slot_utility[:n_init] = torch.clamp(
             self.slot_utility[:n_init] + bonus_full,
             max=self.utility_ceiling
         )
-       
+      
         if bonus.max() > 0.005:
             logger.debug(f"🔗 HebbLayer[{self.layer_idx}]: link bonus до {bonus.max():.4f}")
-   
+  
     @torch.no_grad()
     def _update_association_immunity(self):
         """v5.3.2: Связанные слоты получают иммунитет от смерти + FIX-5: убран спам"""
         n_init = int(self.initialized_slots.item())
         if n_init < 4: # слишком рано — смысла нет
             return
-       
+      
         active_mask = (self.slot_status[:n_init] == self.SLOT_ACTIVE)
         if not active_mask.any():
             return
-       
+      
         # Переходы только по активным слотам
         tm = self.transition_matrix[:n_init, :n_init].clone()
-       
+      
         for i in range(n_init):
             if not active_mask[i]:
                 continue
-               
+              
             # Связанные слоты (входящие + исходящие)
             outgoing = tm[i] > 0.05
             incoming = tm[:, i] > 0.05
             associated = (outgoing | incoming)
             associated[i] = False # себя не усиливаем
-           
+          
             if associated.any():
                 boost = self.immunity_boost * float(self.slot_utility[i])
                 self._association_immunity[:n_init][associated] += boost
-               
+              
                 # 🔹 FIX-5: спам убран — логируем редко и только при значимых изменениях
                 if self.step_counter.item() % 5000 == 0 and associated.sum() > 5:
                     logger.debug(
                         f"🔗 HebbLayer[{self.layer_idx}]: слот {i} усилил иммунитет "
                         f"{associated.sum().item()} связанных слотов (+{boost:.3f})"
                     )
-       
+      
         # Decay иммунитета
         self._association_immunity[:n_init] *= self.immunity_decay
-       
+      
         # Применяем влияние на utility
         influence = torch.sigmoid(self.association_weight) * self._association_immunity[:n_init]
         self.slot_utility[:n_init] = torch.clamp(
@@ -1000,7 +974,7 @@ class TemporalHebbLayer(nn.Module):
             min=0.0,
             max=self.utility_ceiling
         )
-   
+  
     @torch.no_grad()
     def _create_slot(self, pattern):
         """
@@ -1040,26 +1014,26 @@ class TemporalHebbLayer(nn.Module):
             f"🎉 HebbLayer[{self.layer_idx}]: создан слот {idx} "
             f"(теперь {int(self.initialized_slots.item())}/{self.num_slots})"
         )
-   
+  
     @torch.no_grad()
     def _clear_new_accumulators(self):
         self.new_slot_accum_sum.zero_()
         self.new_slot_accum_weight.fill_(0.0)
         self.new_slot_steps.fill_(0)
         self._clear_residual_accumulator()
-   
+  
     @torch.no_grad()
     def _clear_main_accumulator(self):
         self.new_slot_accum_sum.zero_()
         self.new_slot_accum_weight.fill_(0.0)
         self.new_slot_steps.fill_(0)
-   
+  
     @torch.no_grad()
     def _clear_residual_accumulator(self):
         self.new_slot_accum_sum_residual.zero_()
         self.new_slot_accum_weight_residual.fill_(0.0)
         self.new_slot_steps_residual.fill_(0)
-   
+  
     @torch.no_grad()
     def _mark_candidates(self):
         """v5.3.2: CANDIDATE только при полной ёмкости + иммунитет"""
@@ -1070,29 +1044,25 @@ class TemporalHebbLayer(nn.Module):
             return
         step = int(self.step_counter.item())
         is_full = (n_init >= self.num_slots)
-        for i in range(n_init):
-            u = float(self.slot_utility[i])
-            immunity = float(self._association_immunity[i])
-            st = int(self.slot_status[i])
-           
-            if st == self.SLOT_EMPTY:
-                continue
-            # Эффективный порог ниже при высоком иммунитете
-            effective_threshold = self.candidate_threshold * (1.0 - 0.35 * min(immunity, 1.0))
-            effective_threshold = max(effective_threshold, 0.01)
-            if st == self.SLOT_ACTIVE and u < effective_threshold:
-                if is_full: # только когда нет места
-                    self.slot_status[i] = self.SLOT_CANDIDATE
-                    self.slot_candidate_since[i] = step
-                    logger.info(
-                        f"⚠️ HebbLayer[{self.layer_idx}]: слот {i} → CANDIDATE "
-                        f"(utility={u:.3f}, immunity={immunity:.2f}, порог={effective_threshold:.3f})"
-                    )
-                # иначе остаётся ACTIVE и "спит"
-           
-            elif st == self.SLOT_CANDIDATE and u >= self.candidate_threshold:
-                self.slot_status[i] = self.SLOT_ACTIVE
-   
+        is_full_tensor = torch.tensor(is_full, device=self.slot_status.device)
+       
+        # 🔥 ВЕКТОРИЗОВАННАЯ ВЕРСИЯ
+        active_mask = (self.slot_status[:n_init] == self.SLOT_ACTIVE)
+        utils = self.slot_utility[:n_init]
+        immunity = self._association_immunity[:n_init]
+       
+        effective_thresh = self.candidate_threshold * (1.0 - 0.35 * torch.clamp(immunity, max=1.0))
+        effective_thresh = torch.clamp(effective_thresh, min=0.01)
+       
+        to_candidate = active_mask & (utils < effective_thresh) & is_full_tensor
+        self.slot_status[:n_init][to_candidate] = self.SLOT_CANDIDATE
+        self.slot_candidate_since[:n_init][to_candidate] = step
+       
+        # Возврат из CANDIDATE в ACTIVE
+        candidate_mask = (self.slot_status[:n_init] == self.SLOT_CANDIDATE)
+        to_active = candidate_mask & (utils >= self.candidate_threshold)
+        self.slot_status[:n_init][to_active] = self.SLOT_ACTIVE
+  
     @torch.no_grad()
     def _replace_expired(self):
         """🆕 v5.3: Эвикшн только при полной ёмкости"""
@@ -1101,11 +1071,11 @@ class TemporalHebbLayer(nn.Module):
         n_init = int(self.initialized_slots.item())
         if n_init == 0 or n_init < self.num_slots: # пока есть место — НЕ убиваем
             return
-       
+      
         step = int(self.step_counter.item())
         max_rep = max(1, n_init // 10)
         to_replace = []
-       
+      
         for i in range(n_init):
             if len(to_replace) >= max_rep:
                 break
@@ -1116,27 +1086,27 @@ class TemporalHebbLayer(nn.Module):
             )
             if grace_expired:
                 to_replace.append(i)
-       
+      
         if not to_replace:
             return
-       
+      
         w_total = float(self.new_slot_accum_weight)
         accum_available = w_total >= self.accum_min_weight
-       
+      
         if accum_available:
             new_emb = self.new_slot_accum_sum / w_total
             new_norm = F.normalize(new_emb, dim=-1) if new_emb.norm() > 1e-6 else None
         else:
             new_norm = None
-       
+      
         replaced = 0
         used_accum = False
-       
+      
         for idx in to_replace:
             if replaced >= max_rep:
                 break
             replaced_with_data = False
-           
+          
             if new_norm is not None and not used_accum:
                 others = [j for j in range(n_init) if j != idx and int(self.slot_status[j]) == self.SLOT_ACTIVE]
                 can_place = True
@@ -1145,7 +1115,7 @@ class TemporalHebbLayer(nn.Module):
                     sims = torch.matmul(new_norm.unsqueeze(0), o_norms.T).squeeze(0)
                     if sims.max().item() > self.new_slot_sim_threshold:
                         can_place = False
-               
+              
                 if can_place:
                     self.patterns.data[idx] = new_norm
                     self.slot_utility[idx] = 0.4
@@ -1157,25 +1127,24 @@ class TemporalHebbLayer(nn.Module):
                     self.accum_weight[idx] = 0.0
                     replaced_with_data = True
                     used_accum = True
-           
+          
             if not replaced_with_data:
                 self._clear_slot(idx)
-           
+          
             replaced += 1
-       
+      
         if used_accum:
             self._clear_main_accumulator()
-       
+      
         if replaced > 0:
-            # ✅ FIX-3: дефрагментируем только если были реально очищены слоты (EMPTY).
-            # Если слот заменён новыми данными (replaced_with_data=True) — дыр нет,
-            # дефрагментация не нужна и не уменьшает initialized_slots.
             n_empty = int((self.slot_status[:int(self.initialized_slots.item())] == self.SLOT_EMPTY).sum().item())
             if n_empty > 0:
                 self._compact_with_defrag()
+                # 🔥 FIX: Очищаем кэш пар после дефрагментации (индексы изменились)
+                self._last_merged_pairs.clear()
             self.patterns_norm_dirty.fill_(True)
             self._patterns_version.add_(1)
-   
+  
     @torch.no_grad()
     def _clear_slot(self, slot_idx: int):
         self.patterns.data[slot_idx].zero_()
@@ -1187,106 +1156,83 @@ class TemporalHebbLayer(nn.Module):
         self.accum_weight[slot_idx] = 0.0
         self.transition_matrix[slot_idx] = 0.0
         self.transition_matrix[:, slot_idx] = 0.0
-   
+  
     @torch.no_grad()
     def _merge_similar(self):
         """v5.5: Умное слияние БЕЗ ЧЁРНОЙ ДЫРЫ слот 0"""
         if torch.is_grad_enabled():
             return
-        
+       
         n_init = int(self.initialized_slots.item())
         if n_init < 16 or n_init < self.num_slots // 2:
             return
-
-        # Инициализация защит
-        if not hasattr(self, '_last_merged_pairs'):
-            self._last_merged_pairs = set()
-        if not hasattr(self, '_merge_cooldown_step'):
-            self._merge_cooldown_step = 0
-        
         step = int(self.step_counter.item())
         if step - self._merge_cooldown_step < 50:
             return
-
         p_norm = self._get_patterns_norm()[:n_init]
         sim_mat = torch.matmul(p_norm, p_norm.T)
         upper = torch.triu(sim_mat, diagonal=1)
         pairs = (upper > self.merge_threshold).nonzero(as_tuple=False)
-
         if pairs.numel() == 0:
             return
-
         # 🔥 ОЧИЩАЕМ СТАРЫЕ ПАРЫ (оставляем последние 100)
         if len(self._last_merged_pairs) > 100:
             self._last_merged_pairs = set(list(self._last_merged_pairs)[-100:])
-
         merged_info = []
         merged = set()
-
         for pair in pairs[:5]:
             i, j = int(pair[0]), int(pair[1])
             pair_key = tuple(sorted([i, j]))
-            
+           
             if pair_key in self._last_merged_pairs or i in merged or j in merged:
                 continue
-                
+               
             if int(self.slot_status[i]) != self.SLOT_ACTIVE or \
                int(self.slot_status[j]) != self.SLOT_ACTIVE:
                 continue
-
             # 🔥 НОРМАЛИЗОВАННЫЙ СКОР
             max_utility = max(float(self.slot_utility[i]), float(self.slot_utility[j]))
             max_connections = max(float(self.transition_matrix[i].sum()), float(self.transition_matrix[j].sum()))
-            
+           
             norm_utility_i = float(self.slot_utility[i]) / max_utility if max_utility > 0 else 0
             norm_utility_j = float(self.slot_utility[j]) / max_utility if max_utility > 0 else 0
-            
+           
             norm_conn_i = float(self.transition_matrix[i].sum()) / max_connections if max_connections > 0 else 0
             norm_conn_j = float(self.transition_matrix[j].sum()) / max_connections if max_connections > 0 else 0
-            
+           
             # Комбинированный скор (60% utility, 40% связи)
             score_i = norm_utility_i * 0.6 + norm_conn_i * 0.4
             score_j = norm_utility_j * 0.6 + norm_conn_j * 0.4
-
             # 🔥 ЗАЩИТА ОТ ДОМИНИРОВАНИЯ СЛОТА 0
-            if i == 0 and score_i - score_j < 0.2:  # если преимущество < 20%
+            if i == 0 and score_i - score_j < 0.2: # если преимущество < 20%
                 keep, drop = j, i
             elif j == 0 and score_j - score_i < 0.2:
                 keep, drop = i, j
             else:
                 keep = i if score_i >= score_j else j
                 drop = j if keep == i else i
-
             # Слияние
             self.transition_matrix[keep] += self.transition_matrix[drop]
             self.transition_matrix[:, keep] += self.transition_matrix[:, drop]
-            
+           
             rs = self.transition_matrix[keep].sum()
             if rs > 1e-4:
                 self.transition_matrix[keep] /= rs
             cs = self.transition_matrix[:, keep].sum()
             if cs > 1e-4:
                 self.transition_matrix[:, keep] /= cs
-
             self.slot_utility[keep] = max(float(self.slot_utility[i]), float(self.slot_utility[j]))
             self._clear_slot(drop)
-
             merged.add(i)
             merged.add(j)
             self._last_merged_pairs.add(pair_key)
-            
+           
             merged_info.append(f"{drop}→{keep} (u:{self.slot_utility[keep]:.2f})")
-
         if merged_info:
             self._merge_cooldown_step = step
             self._patterns_version.add_(1)
-            #logger.info(f"🔄 HebbLayer[{self.layer_idx}]: Слияние слотов: {', '.join(merged_info)}")
-            
-            n_empty = int((self.slot_status[:n_init] == self.SLOT_EMPTY).sum().item())
-            if n_empty > 0:
-                self._compact_with_defrag()
             self.patterns_norm_dirty.fill_(True)
-   
+  
     @torch.no_grad()
     def _decay_unused(self):
         """v5.3.2: Decay с учётом иммунитета по ассоциациям"""
@@ -1308,7 +1254,7 @@ class TemporalHebbLayer(nn.Module):
             if usage == 0.0:
                 if age < 1000 or not is_full:
                     continue
-               
+              
                 # Иммунитет сильно защищает
                 if immunity > 0.5:
                     self.slot_utility[i] *= (self.decay_factor_new * (1.0 - 0.3 * immunity))
@@ -1317,19 +1263,19 @@ class TemporalHebbLayer(nn.Module):
                     self.slot_utility[i] *= self.decay_factor_new
             else:
                 self.slot_utility[i] *= self.decay_factor
-   
+  
     @torch.no_grad()
     def _compact_with_defrag(self):
         n_init = int(self.initialized_slots.item())
         if n_init == 0:
             return
-           
+          
         alive = [i for i in range(n_init)
                 if int(self.slot_status[i]) != self.SLOT_EMPTY]
-       
+      
         if len(alive) == n_init:
             return
-       
+      
         for new_i, old_i in enumerate(alive):
             if new_i == old_i:
                 continue
@@ -1343,15 +1289,15 @@ class TemporalHebbLayer(nn.Module):
             self.slot_last_used[new_i] = self.slot_last_used[old_i]
             self.accum_sum[new_i] = self.accum_sum[old_i].clone()
             self.accum_weight[new_i] = self.accum_weight[old_i]
-       
+      
         tail_start = len(alive)
         for i in range(tail_start, n_init):
             self._clear_slot(i)
             self.slot_candidate_since[i] = 0
-       
+      
         # Очищаем матрицу перед перестройкой
         self.transition_matrix.zero_()
-       
+      
         if len(alive) > 1:
             new_tm = torch.zeros(self.num_slots, self.num_slots,
                                 device=self.transition_matrix.device)
@@ -1359,24 +1305,19 @@ class TemporalHebbLayer(nn.Module):
                 for new_j, old_j in enumerate(alive):
                     new_tm[new_i, new_j] = self.transition_matrix[old_i, old_j]
             self.transition_matrix.copy_(new_tm)
-       
-        # ✅ FIX-2: initialized_slots = реальное кол-во живых слотов после дефрагментации.
-        # Это корректно: слоты [0..len(alive)-1] заняты, дыр нет.
-        # НО: _try_create_or_strengthen использует n_init < num_slots как сигнал "есть место".
-        # После дефрагментации место реально есть, и это правильно — новый _create_slot
-        # найдёт первый EMPTY слот (индекс len(alive)) и запишет туда.
+      
         self.initialized_slots.fill_(len(alive))
         self.prev_idx_valid.fill_(False)
-   
+  
     @torch.no_grad()
     def _update_stdp(self, best_idx, write_gate):
         """🔥 ARCH-4: STDP только для ACTIVE→ACTIVE переходов"""
         curr_n = len(best_idx)
         n_write = min(curr_n, self.prev_best_idx.shape[0])
-       
+      
         n_init = int(self.initialized_slots.item())
         active_mask = (self.slot_status[:n_init] == self.SLOT_ACTIVE)
-       
+      
         if self.prev_idx_valid.item():
             prev_n = int(self.prev_batch_size)
             n = min(prev_n, curr_n, n_write)
@@ -1384,12 +1325,12 @@ class TemporalHebbLayer(nn.Module):
                 prev = self.prev_best_idx[:n]
                 curr = best_idx[:n]
                 w = write_gate.squeeze(-1)[:n].float()
-               
+              
                 # 🔥 ARCH-4: Фильтр ACTIVE→ACTIVE
                 prev_active = active_mask[prev]
                 curr_active = active_mask[curr]
                 valid = prev_active & curr_active
-               
+              
                 if valid.any():
                     p = prev[valid]
                     c = curr[valid]
@@ -1403,11 +1344,89 @@ class TemporalHebbLayer(nn.Module):
                         rs = row.sum()
                         if rs > 1e-4:
                             self.transition_matrix[ri] = row / rs
-       
+      
         self.prev_best_idx[:n_write] = best_idx[:n_write]
         self.prev_write_gate[:n_write] = write_gate.squeeze(-1)[:n_write]
         self.prev_batch_size.fill_(curr_n)
         self.prev_idx_valid.fill_(True)
+        
+    @torch.no_grad()
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        """
+        🔥 v5.5: Авто-расширение слотов + FIX для квадратных матриц (transition_matrix).
+        Поддерживает расширение:
+        - Тензоров [N, ...] → [M, ...] (паттерны, utility, статусы)
+        - Квадратных матриц [N, N] → [M, M] (transition_matrix)
+        """
+        current_slots = self.num_slots
+        device = self.patterns.device
+        fixed_state_dict = {}
+        
+        for key, param in state_dict.items():
+            if not isinstance(param, torch.Tensor):
+                fixed_state_dict[key] = param
+                continue
+
+            # 🔥 FIX: Явная проверка None вместо 'or'
+            target = self._buffers.get(key, None)
+            if target is None:
+                target = self._parameters.get(key, None)
+                
+            if target is None:
+                fixed_state_dict[key] = param
+                continue
+
+            target_shape = target.shape
+            param_shape = param.shape
+
+            if target_shape == param_shape:
+                fixed_state_dict[key] = param
+                continue
+
+            # 1. Расширение по первому измерению [N, D] → [M, D]
+            needs_expansion_1d = (
+                len(target_shape) == len(param_shape) and
+                param_shape[0] < current_slots and
+                target_shape[0] == current_slots and
+                target_shape[1:] == param_shape[1:]
+            )
+
+            if needs_expansion_1d:
+                new_param = torch.zeros(target_shape, dtype=target.dtype, device=device)
+                old_n = param_shape[0]
+                new_param[:old_n] = param.to(device)
+                fixed_state_dict[key] = new_param
+                logger.info(f"📦 HebbLayer[{self.layer_idx}]: расширен {key} {param_shape} → {target_shape}")
+                continue
+
+            # 2. 🔥 Расширение квадратных матриц [N, N] → [M, M]
+            needs_expansion_sq = (
+                len(target_shape) == 2 and len(param_shape) == 2 and
+                param_shape[0] == param_shape[1] and
+                target_shape[0] == target_shape[1] and
+                param_shape[0] < target_shape[0] and
+                target_shape[0] == current_slots
+            )
+
+            if needs_expansion_sq:
+                new_param = torch.zeros(target_shape, dtype=target.dtype, device=device)
+                old_n = param_shape[0]
+                # Копируем старые связи в левый верхний угол
+                new_param[:old_n, :old_n] = param.to(device)
+                fixed_state_dict[key] = new_param
+                logger.info(f"📦 HebbLayer[{self.layer_idx}]: расширена матрица {key} {param_shape} → {target_shape}")
+                continue
+
+            # Несовпадение, которое нельзя исправить
+            fixed_state_dict[key] = param
+            if target_shape != param_shape:
+                logger.warning(f"⚠️ HebbLayer[{self.layer_idx}]: несовпадение {key} {param_shape} vs {target_shape} (не расширено)")
+
+        if "patterns" in fixed_state_dict:
+            self.patterns_norm_dirty.fill_(True)
+
+        return super().load_state_dict(fixed_state_dict, strict=strict, assign=assign)
+    
     # ================================================================
     # ПУБЛИЧНЫЕ МЕТОДЫ
     # ================================================================
@@ -1420,7 +1439,7 @@ class TemporalHebbLayer(nn.Module):
                 self._decay_unused()
                 self._mark_candidates()
                 self._replace_expired()
-   
+  
     def freeze_patterns(self):
         self.patterns_frozen.fill_(True)
         self.prev_idx_valid.fill_(False)
@@ -1428,29 +1447,28 @@ class TemporalHebbLayer(nn.Module):
             self.accum_sum.zero_()
             self.accum_weight.zero_()
             self._clear_new_accumulators()
-   
+  
     def unfreeze_patterns(self):
         self.patterns_frozen.fill_(False)
-   
+  
     def is_patterns_frozen(self):
         return bool(self.patterns_frozen.item())
-   
+  
     def _is_meta(self):
         return self.patterns.device.type == 'meta'
-   
+  
     def _get_patterns_norm(self):
         if self.patterns_norm_dirty.item():
             self.patterns_norm_cache = F.normalize(self.patterns.detach(), dim=-1)
             self.patterns_norm_dirty.fill_(False)
         return self.patterns_norm_cache
-   
+  
     def _get_temperature(self):
         if self._is_meta():
             return torch.tensor(2.0, device='meta')
         temp = torch.exp(self.temperature_logit.clamp(-2.0, 2.0)).clamp(0.5, 4.0)
         temp = torch.nan_to_num(temp, nan=2.0, posinf=4.0, neginf=0.5)
         return torch.clamp(temp, 0.5, 8.0)
-
     @torch.no_grad()
     def analyze_transitions(self):
         """Анализирует качество связей между слотами в Hebb"""
@@ -1464,27 +1482,27 @@ class TemporalHebbLayer(nn.Module):
                 'non_zero': 0,
                 'total': 0
             }
-        
+       
         # 🔥 ИСПРАВЛЕНИЕ: берём ТОЛЬКО активные слоты
         active_mask = (self.slot_status[:n_init] == self.SLOT_ACTIVE)
         active_indices = torch.where(active_mask)[0]
-        
+       
         if len(active_indices) < 2:
             return {...}
-        
+       
         # Матрица переходов для активных слотов
         tm = self.transition_matrix[:n_init, :n_init]
         trans = tm[active_indices][:, active_indices]
-        
+       
         non_zero = (trans > 0.01).sum().item()
         total = len(active_indices) ** 2
         density = non_zero / total if total > 0 else 0
-        
+       
         if non_zero > 0:
             mean_strength = trans[trans > 0.01].mean().item()
         else:
             mean_strength = 0.0
-        
+       
         # Энтропия распределений
         row_sums = trans.sum(dim=1, keepdim=True) + 1e-8
         probs = trans / row_sums
@@ -1493,10 +1511,10 @@ class TemporalHebbLayer(nn.Module):
             entropy = -(probs[valid_rows] * (probs[valid_rows] + 1e-10).log()).sum(dim=1).mean().item()
         else:
             entropy = 0.0
-        
+       
         logger.info(f"🔗 HebbLayer[{self.layer_idx}]: плотность={density:.4f} ({non_zero}/{total}), "
                     f"средняя сила={mean_strength:.3f}, энтропия={entropy:.3f}")
-        
+       
         return {
             'density': density,
             'mean_strength': mean_strength,
@@ -1505,7 +1523,6 @@ class TemporalHebbLayer(nn.Module):
             'total': total,
             'active_slots': len(active_indices)
         }
-
     @torch.no_grad()
     def show_hubs(self, top_k=5):
         """Показывает самые связные слоты (хабы) в Hebb"""
@@ -1513,29 +1530,29 @@ class TemporalHebbLayer(nn.Module):
         if n_init == 0:
             logger.info(f"🌟 HebbLayer[{self.layer_idx}]: нет активных слотов")
             return []
-        
+       
         active_mask = (self.slot_status[:n_init] == self.SLOT_ACTIVE)
         if not active_mask.any():
             logger.info(f"🌟 HebbLayer[{self.layer_idx}]: нет активных слотов")
             return []
-        
+       
         # 🔥 ИСПРАВЛЕНИЕ: обрезаем матрицу до n_init x n_init
         tm = self.transition_matrix[:n_init, :n_init]
-        
+       
         threshold = 0.01
-        in_degree = (tm > threshold).sum(dim=0).float()   # [n_init]
-        out_degree = (tm > threshold).sum(dim=1).float()  # [n_init]
-        total_degree = in_degree + out_degree              # [n_init] - теперь одинаково!
-        
+        in_degree = (tm > threshold).sum(dim=0).float() # [n_init]
+        out_degree = (tm > threshold).sum(dim=1).float() # [n_init]
+        total_degree = in_degree + out_degree # [n_init] - теперь одинаково!
+       
         # Маскируем неактивные слоты
         total_degree[~active_mask] = -1
-        
+       
         k = min(top_k, active_mask.sum().item())
         if k == 0:
             return []
-        
+       
         values, indices = torch.topk(total_degree, k)
-        
+       
         logger.info(f"🌟 HebbLayer[{self.layer_idx}] Топ-{k} хабов:")
         hubs_info = []
         for i, (idx, val) in enumerate(zip(indices.tolist(), values.tolist())):
@@ -1543,20 +1560,20 @@ class TemporalHebbLayer(nn.Module):
             age = int(self.slot_age[idx])
             usage = float(self.slot_usage_count[idx])
             immunity = float(self._association_immunity[idx]) if hasattr(self, '_association_immunity') else 0.0
-            
+           
             # Эмодзи для типа слота
             if immunity > 0.5:
-                type_emoji = "🛡️"  # защищённый
+                type_emoji = "🛡️" # защищённый
             elif utility > 0.8:
-                type_emoji = "👑"  # король
+                type_emoji = "👑" # король
             elif utility > 0.5:
-                type_emoji = "🟢"  # активный
+                type_emoji = "🟢" # активный
             else:
-                type_emoji = "🟡"  # слабый
-            
-            logger.info(f"   #{i+1}: {type_emoji} слот {idx}, связей={int(val)}, "
+                type_emoji = "🟡" # слабый
+           
+            logger.info(f" #{i+1}: {type_emoji} слот {idx}, связей={int(val)}, "
                        f"utility={utility:.3f}, age={age}, использований={int(usage)}")
-            
+           
             hubs_info.append({
                 'slot': idx,
                 'connections': int(val),
@@ -1566,53 +1583,52 @@ class TemporalHebbLayer(nn.Module):
                 'immunity': immunity,
                 'type_emoji': type_emoji
             })
-        
+       
         return hubs_info
-
     @torch.no_grad()
     def analyze_network(self):
         """Комплексный анализ сети связей в Hebb"""
         n_init = int(self.initialized_slots.item())
         if n_init < 2:
             return {}
-        
+       
         active_mask = (self.slot_status[:n_init] == self.SLOT_ACTIVE)
         active_indices = torch.where(active_mask)[0]
-        
+       
         if len(active_indices) < 2:
             return {}
-        
+       
         # 🔥 ИСПРАВЛЕНИЕ: работаем ТОЛЬКО с матрицей размера n_init x n_init
         tm = self.transition_matrix[:n_init, :n_init]
-        
+       
         threshold = 0.01
-        in_degree = (tm > threshold).sum(dim=0).float()   # [n_init]
-        out_degree = (tm > threshold).sum(dim=1).float()  # [n_init]
-        
+        in_degree = (tm > threshold).sum(dim=0).float() # [n_init]
+        out_degree = (tm > threshold).sum(dim=1).float() # [n_init]
+       
         # Основные метрики
         trans_stats = self.analyze_transitions()
         hubs = self.show_hubs(top_k=3)
-        
+       
         # 🔥 ИСПРАВЛЕНИЕ: все тензоры должны быть одинакового размера [n_init]
-        in_zero = (in_degree == 0)   # [n_init]
-        out_zero = (out_degree == 0)  # [n_init]
-        
+        in_zero = (in_degree == 0) # [n_init]
+        out_zero = (out_degree == 0) # [n_init]
+       
         # Изолированные слоты (нет связей) - используем ПОЭЛЕМЕНТНОЕ И
-        isolated_mask = active_mask & in_zero & out_zero  # все три [n_init]
+        isolated_mask = active_mask & in_zero & out_zero # все три [n_init]
         isolated_count = isolated_mask.sum().item()
-        
+       
         # Мосты - слоты с высокой связностью
-        betweenness = in_degree * out_degree  # [n_init]
+        betweenness = in_degree * out_degree # [n_init]
         median_val = betweenness[active_mask].median() if active_mask.any() else 0
         bridges_mask = active_mask & (betweenness > median_val)
         bridge_count = bridges_mask.sum().item()
-        
+       
         logger.info(f"🌐 HebbLayer[{self.layer_idx}] СЕТЬ: "
                     f"активных={len(active_indices)}, "
                     f"изолированных={isolated_count}, "
                     f"мостов={bridge_count}, "
                     f"плотность={trans_stats['density']:.4f}")
-        
+       
         return {
             'active_count': len(active_indices),
             'isolated_count': isolated_count,
@@ -1621,7 +1637,7 @@ class TemporalHebbLayer(nn.Module):
             'entropy': trans_stats['entropy'],
             'hubs': hubs
         }
-   
+  
     def log_init(self, total_layers=None):
         if self._is_meta() or self.layer_idx != 0:
             return
@@ -1630,17 +1646,7 @@ class TemporalHebbLayer(nn.Module):
             self.total_layers = total_layers
         n = self.total_layers or total_layers or "?"
         logger.info(f"🧠 TemporalHebbLayer v5.4: {n} слоёв × {self.num_slots} слотов")
-        logger.info(f" • 🔴 FIX-1..6: Все критические исправления v5.2")
-        logger.info(f" • 🔥 ARCH-1..5: Архитектурные улучшения v5.2")
-        logger.info(f" • 🆕 v5.3-ARCH-6: Слоты НЕ умирают пока initialized < num_slots")
-        logger.info(f" • 🆕 v5.3-ARCH-7: CANDIDATE и эвикшн только при полной ёмкости")
-        logger.info(f" • 🆕 v5.3-ARCH-8: При полной: слияние → усиление → эвикшн")
-        logger.info(f" • 🆕 v5.3-ARCH-9: Diversity bonus для редких слотов")
-        logger.info(f" • 🛠 v5.3.9: Антиколлапс, защита потолка utility, фикс возраста")
-        logger.info(f" • 🔥 v5.4: Исправлен бесконечный цикл slot-63 (merge→defrag→create→repeat)")
-        logger.info(f" • 🔥 v5.4: _try_create_or_strengthen — явные приоритеты без fallthrough")
-        logger.info(f" • 🔥 v5.4: дефрагментация только при наличии EMPTY-дыр")
-    
+   
     def get_stats(self):
         if self._is_meta():
             return self._fallback_stats()
@@ -1698,7 +1704,7 @@ class TemporalHebbLayer(nn.Module):
             "max_immunity": float(self._association_immunity[:n_init].max()) if n_init > 0 else 0.0,
             "association_weight": float(torch.sigmoid(self.association_weight).item()),
         }
-   
+  
     def _fallback_stats(self):
         return {
             "layer_idx": self.layer_idx,
@@ -2632,12 +2638,12 @@ class DynamicPsycheCoreV6(nn.Module):
         # =============================================
         controller_input_size = self.num_traits + self.num_drives + 1
         controller_output_size = 10
-        controller_hidden = getattr(config, 'controller_hidden_dim', 32)  # ← берем из конфига
+        controller_hidden = getattr(config, 'controller_hidden_dim', 32)
         
         self.controller = ImprovedPsycheController(
             controller_input_size, 
             controller_output_size,
-            hidden_dim=controller_hidden  # ← передаем в контроллер
+            hidden_dim=controller_hidden
         )
         
         # Value сеть для PPO
@@ -2703,20 +2709,39 @@ class DynamicPsycheCoreV6(nn.Module):
         self.register_buffer("reward_history", torch.zeros(100))
         self.register_buffer("reward_idx", torch.tensor(0))
         
-        # === ВЛИЯНИЕ НА HIDDEN STATES ===
+        # ===========================================================
+        # 🔥 ВЛИЯНИЕ НА HIDDEN STATES (ДИНАМИЧЕСКИЙ ВЕС, БЕЗ ГРАДИЕНТОВ)
+        # ===========================================================
         num_inputs = self.num_traits + self.num_drives
         self.input_norm = nn.LayerNorm(num_inputs)
         self.psyche_to_hidden = nn.Linear(num_inputs, config.n_embd, bias=False)
         
-        self.psyche_influence_weight = nn.Parameter(
-            torch.tensor(getattr(config, 'psyche_influence_weight', 0.35))
-        )
+        # 🔥 ДИНАМИЧЕСКИЙ ВЕС ВЛИЯНИЯ (обновляется через tick, НЕ через градиенты!)
+        self.register_buffer("psyche_influence_dynamic", torch.tensor(0.25))  # начальное значение
+        self.register_buffer("psyche_influence_target", torch.tensor(0.25))
+        self.register_buffer("psyche_influence_velocity", torch.tensor(0.0))
+        
+        # Параметры динамики (тоже буферы, не обучаемые)
+        self.register_buffer("psyche_influence_inertia", torch.tensor(0.95))
+        self.register_buffer("psyche_influence_max", torch.tensor(0.45))
+        self.register_buffer("psyche_influence_min", torch.tensor(0.10))
+        
+        logger.info(f"🧠 Динамический вес влияния: range=[0.10, 0.45], inertia=0.95 (БЕЗ ГРАДИЕНТОВ)")
+        
+        # ===========================================================
+        # 🔥 ЗАЩИТА ОСТАЛЬНЫХ ПАРАМЕТРОВ (кроме opposition_weights)
+        # ===========================================================
+        for name, param in self.named_parameters():
+            if 'opposition_weights' in name:
+                continue
+            param.register_hook(lambda grad: torch.clamp(grad, -5.0, 5.0))
+        logger.info("🛡️ Защита параметров психики: clip ±5.0")
         
         max_seq_len = getattr(config, "n_positions", 2048)
         decay = torch.linspace(1.0, 0.4, max_seq_len)
         self.register_buffer("decay_template", decay)
         
-        # ИСПРАВЛЕНИЕ: используем один буфер
+        # Буферы для истории эмбеддингов
         self.register_buffer("psyche_embed_history", torch.zeros(config.n_embd))
         self.register_buffer("embed_change_history", torch.zeros(10))
         self.register_buffer("embed_history_idx", torch.tensor(0))
@@ -2730,9 +2755,9 @@ class DynamicPsycheCoreV6(nn.Module):
         self.register_buffer("_prev_controller_action", torch.zeros(controller_output_size))
         self.register_buffer("_prev_controller_reward", torch.tensor(0.0))
  
-        # 🔥 ДОБАВЛЕНО: Регистрация буферов для repulsion loss (один раз!)
+        # Регистрация буферов для repulsion loss
         self.register_buffer('_repulsion_loss_buffer', torch.tensor(0.0))
-        self._current_repulsion_loss = None  # Для хранения активного rep_loss с градиентами
+        self._current_repulsion_loss = None
  
         logger.info(f"🧠 Динамичная психика v9.0 с полным PPO: {self.num_traits} черт, {self.num_drives} драйвов")
     
@@ -3111,6 +3136,69 @@ class DynamicPsycheCoreV6(nn.Module):
             except Exception as e:
                 logger.debug(f"⚠ Ошибка вычисления repulsion loss: {e}")
                 self._current_repulsion_loss = None
+        
+        # ===================================================================
+        # 🔥 ДИНАМИЧЕСКАЯ РЕГУЛИРОВКА СИЛЫ ВЛИЯНИЯ
+        # ===================================================================
+        with torch.no_grad():
+            # Получаем метрики стабильности и энтропии из dynamics
+            stability = getattr(self.dynamics, '_system_stability', torch.tensor(0.5)).item()
+            entropy = getattr(self.dynamics, '_system_entropy', torch.tensor(0.5)).item()
+            mood_abs = abs(self.mood.mood_state.item())
+            
+            # Вычисляем целевую силу влияния
+            target = 0.25  # базовое значение
+            
+            # Корректировка по стабильности
+            if stability < 0.3:
+                target -= 0.08  # Система нестабильна → уменьшаем влияние
+            elif stability > 0.7:
+                target += 0.05  # Система стабильна → можно усилить влияние
+            
+            # Корректировка по энтропии
+            if entropy > 0.7:
+                target -= 0.06  # Высокая энтропия → уменьшаем влияние
+            elif entropy < 0.3:
+                target += 0.04  # Низкая энтропия → можно усилить влияние
+            
+            # Влияние настроения (немного)
+            target += mood_abs * 0.03
+            
+            # Проверяем наличие min/max буферов
+            if hasattr(self, 'psyche_influence_min'):
+                target = max(self.psyche_influence_min.item(), 
+                            min(self.psyche_influence_max.item(), target))
+            
+            # Плавное обновление целевого значения
+            if not hasattr(self, 'psyche_influence_target'):
+                self.register_buffer('psyche_influence_target', torch.tensor(target))
+                self.register_buffer('psyche_influence_dynamic', torch.tensor(target))
+                self.register_buffer('psyche_influence_velocity', torch.tensor(0.0))
+                self.register_buffer('psyche_influence_inertia', torch.tensor(0.85))
+                self.register_buffer('psyche_influence_min', torch.tensor(0.10))
+                self.register_buffer('psyche_influence_max', torch.tensor(0.45))
+            
+            # Обновляем целевое значение с EMA
+            self.psyche_influence_target.data = (
+                self.psyche_influence_target * 0.95 + target * 0.05
+            )
+            
+            # Обновляем динамическое значение с инерцией
+            acceleration = (self.psyche_influence_target - self.psyche_influence_dynamic) * 0.1
+            self.psyche_influence_velocity.data = (
+                self.psyche_influence_velocity * self.psyche_influence_inertia + acceleration
+            )
+            self.psyche_influence_dynamic.data += self.psyche_influence_velocity
+            self.psyche_influence_dynamic.data.clamp_(
+                self.psyche_influence_min.item(), 
+                self.psyche_influence_max.item()
+            )
+            
+            # Логируем изменения
+            if self.total_ticks.item() % 200 == 0:
+                logger.info(f"🎛️ Динамическая сила влияния: target={self.psyche_influence_target.item():.3f}, "
+                           f"current={self.psyche_influence_dynamic.item():.3f}, "
+                           f"stability={stability:.2f}, entropy={entropy:.2f}, mood={mood_abs:.2f}")
         
         # ===================================================================
         # 🔥 ВНУТРЕННЕЕ ОБНОВЛЕНИЕ КОНТРОЛЛЕРА С ПОЛНОЙ ИЗОЛЯЦИЕЙ
@@ -3663,12 +3751,11 @@ class DynamicPsycheCoreV6(nn.Module):
         if not isinstance(hidden_states, torch.Tensor):
             raise TypeError(f"Expected torch.Tensor or tuple, got {type(hidden_states)}")
         
-        # 🔥🔥🔥 ИСПРАВЛЕНИЕ: Запоминаем исходную размерность
+        # Запоминаем исходную размерность
         original_dim = hidden_states.dim()
         was_2d = (original_dim == 2)
         
         if was_2d:
-            # Если 2D [batch, dim] -> добавляем seq_len=1
             hidden_states = hidden_states.unsqueeze(1)
         
         batch_size, seq_len, hidden_dim = hidden_states.shape
@@ -3680,9 +3767,14 @@ class DynamicPsycheCoreV6(nn.Module):
         if torch.isnan(trait_tensors).any() or torch.isnan(drive_tensors).any():
             return hidden_states.squeeze(1) if was_2d else hidden_states
         
-        input_vec = torch.cat([trait_tensors, drive_tensors], dim=0)
-        input_vec = self.input_norm(input_vec)
-        psyche_embed = torch.tanh(self.psyche_to_hidden(input_vec))
+        # АРХИТЕКТУРНАЯ СТЕНА: Отсекаем градиенты LM от внутренностей психики!
+        with torch.no_grad():
+            input_vec = torch.cat([trait_tensors, drive_tensors], dim=0)
+            input_vec = self.input_norm(input_vec)
+            psyche_embed_raw = torch.tanh(self.psyche_to_hidden(input_vec))
+        
+        # Возвращаем тензор в вычислительный граф
+        psyche_embed = psyche_embed_raw.detach()
         
         prev_embed = self.psyche_embed_history.detach().to(device)
         embed_change = torch.norm(psyche_embed - prev_embed).item()
@@ -3701,6 +3793,11 @@ class DynamicPsycheCoreV6(nn.Module):
             smoothing = 0.55
         
         psyche_embed = smoothing * prev_embed + (1 - smoothing) * psyche_embed
+        
+        # Нормализуем после сглаживания
+        psyche_embed = F.normalize(psyche_embed, dim=0) * torch.norm(psyche_embed, dim=0).mean()
+        psyche_embed = torch.tanh(psyche_embed)
+        
         self.psyche_embed_history.data.copy_(psyche_embed.detach())
         
         if seq_len <= len(self.decay_template):
@@ -3708,18 +3805,41 @@ class DynamicPsycheCoreV6(nn.Module):
         else:
             decay = torch.linspace(1.0, 0.3, seq_len, device=device)
         
-        mood_factor = 1.0 + abs(self.mood.mood_state.item()) * 0.4
+        # ===========================================================
+        # 🔥 ВЫЧИСЛЕНИЕ ВЛИЯНИЯ (ДИНАМИЧЕСКИЙ ВЕС, БЕЗ ГРАДИЕНТОВ)
+        # ===========================================================
+        
+        # Ограничиваем mood_factor
+        mood_abs = min(abs(self.mood.mood_state.item()), 1.0)
+        mood_factor = 1.0 + mood_abs * 0.4
+        
+        # 🔥 ДИНАМИЧЕСКИЙ ВЕС (обновляется в tick, НЕ обучается)
+        influence_scale = self.psyche_influence_dynamic.item()
+        
+        # Вычисляем влияние
         influence = psyche_embed.view(1, 1, -1) * decay.view(1, -1, 1)
-        influence = influence * self.psyche_influence_weight * mood_factor
+        influence = influence * influence_scale * mood_factor
+        
+        # Tanh с последующим clamp
         influence = torch.tanh(influence * 0.6)
+        influence = torch.clamp(influence, -1.5, 1.5)
         
-        result = hidden_states + influence * 0.35
+        # Итоговое добавление
+        result = hidden_states + influence * 0.25
         
-        # 🔥🔥🔥 ИСПРАВЛЕНИЕ: Возвращаем в исходной размерности
+        # RMS нормализация
+        rms = result.pow(2).mean(dim=-1, keepdim=True).sqrt()
+        target_rms = 0.65
+        result = result * target_rms / (rms + 1e-6)
+        
+        # Дополнительная защита
+        result = torch.clamp(result, -8.0, 8.0)
+        
+        # Возвращаем в исходной размерности
         if was_2d:
             return result.squeeze(1)
         return result
-
+    
     def get_detailed_report(self) -> Dict:
         """🔥 ОПТИМИЗИРОВАННЫЙ подробный отчёт"""
         device = self.trait_raw.device
@@ -3948,8 +4068,23 @@ class DynamicPsycheCoreV6(nn.Module):
             "opposition_weights": self.opposition_weights.detach().cpu().clone(),
             "resonance_frequency": self.resonance_frequency.detach().cpu().clone(),
             "resonance_amplitude": self.resonance_amplitude.detach().cpu().clone(),
-            "psyche_influence_weight": self.psyche_influence_weight.detach().cpu().clone(),
+            # УБРАЛИ старый psyche_influence_weight
         }
+        
+        # 🔥 ДОБАВЛЯЕМ НОВЫЙ БЛОК СОСТОЯНИЙ ВЛИЯНИЯ (Кинематика)
+        influence_state = {}
+        if hasattr(self, 'psyche_influence_dynamic'):
+            influence_state["psyche_influence_dynamic"] = self.psyche_influence_dynamic.cpu().clone()
+        if hasattr(self, 'psyche_influence_target'):
+            influence_state["psyche_influence_target"] = self.psyche_influence_target.cpu().clone()
+        if hasattr(self, 'psyche_influence_velocity'):
+            influence_state["psyche_influence_velocity"] = self.psyche_influence_velocity.cpu().clone()
+        if hasattr(self, 'psyche_influence_min'):
+            influence_state["psyche_influence_min"] = self.psyche_influence_min.cpu().clone()
+        if hasattr(self, 'psyche_influence_max'):
+            influence_state["psyche_influence_max"] = self.psyche_influence_max.cpu().clone()
+        if hasattr(self, 'psyche_influence_inertia'):
+            influence_state["psyche_influence_inertia"] = self.psyche_influence_inertia.cpu().clone()
         
         dynamics_state = {
             "base_plasticity": self.dynamics.base_plasticity.detach().cpu().clone(),
@@ -4035,6 +4170,7 @@ class DynamicPsycheCoreV6(nn.Module):
         return {
             **base_state,
             **learnable_params,
+            "influence_state": influence_state,  # 🔥 ВОТ ЭТО ДОБАВИТЬ
             "dynamics": dynamics_state,
             "action_weights": action_weights_state,
             "mood_params": mood_params,
@@ -4068,6 +4204,49 @@ class DynamicPsycheCoreV6(nn.Module):
             
             if "total_ticks" in state and state["total_ticks"] is not None:
                 self.total_ticks.copy_(state["total_ticks"].to(self.total_ticks.device))
+            
+            # ===========================================================
+            # 🔥 ПАРАМЕТРЫ ВЛИЯНИЯ (Кинематика)
+            # ===========================================================
+            if "influence_state" in state and state["influence_state"] is not None:
+                inf = state["influence_state"]
+                
+                # Создаем буферы, если их еще нет
+                if not hasattr(self, 'psyche_influence_dynamic'):
+                    self.register_buffer('psyche_influence_dynamic', torch.tensor(0.25))
+                if not hasattr(self, 'psyche_influence_target'):
+                    self.register_buffer('psyche_influence_target', torch.tensor(0.25))
+                if not hasattr(self, 'psyche_influence_velocity'):
+                    self.register_buffer('psyche_influence_velocity', torch.tensor(0.0))
+                if not hasattr(self, 'psyche_influence_min'):
+                    self.register_buffer('psyche_influence_min', torch.tensor(0.10))
+                if not hasattr(self, 'psyche_influence_max'):
+                    self.register_buffer('psyche_influence_max', torch.tensor(0.45))
+                if not hasattr(self, 'psyche_influence_inertia'):
+                    self.register_buffer('psyche_influence_inertia', torch.tensor(0.85))
+                
+                if "psyche_influence_dynamic" in inf:
+                    self.psyche_influence_dynamic.copy_(inf["psyche_influence_dynamic"].to(self.psyche_influence_dynamic.device))
+                if "psyche_influence_target" in inf:
+                    self.psyche_influence_target.copy_(inf["psyche_influence_target"].to(self.psyche_influence_target.device))
+                if "psyche_influence_velocity" in inf:
+                    self.psyche_influence_velocity.copy_(inf["psyche_influence_velocity"].to(self.psyche_influence_velocity.device))
+                if "psyche_influence_min" in inf:
+                    self.psyche_influence_min.copy_(inf["psyche_influence_min"].to(self.psyche_influence_min.device))
+                if "psyche_influence_max" in inf:
+                    self.psyche_influence_max.copy_(inf["psyche_influence_max"].to(self.psyche_influence_max.device))
+                if "psyche_influence_inertia" in inf:
+                    self.psyche_influence_inertia.copy_(inf["psyche_influence_inertia"].to(self.psyche_influence_inertia.device))
+            
+            # ===========================================================
+            # 🔥 Восстанавливаем старые обучаемые параметры (без influence_weight)
+            # ===========================================================
+            if "opposition_weights" in state and state["opposition_weights"] is not None:
+                self.opposition_weights.data.copy_(state["opposition_weights"].to(self.opposition_weights.device))
+            if "resonance_frequency" in state and state["resonance_frequency"] is not None:
+                self.resonance_frequency.data.copy_(state["resonance_frequency"].to(self.resonance_frequency.device))
+            if "resonance_amplitude" in state and state["resonance_amplitude"] is not None:
+                self.resonance_amplitude.data.copy_(state["resonance_amplitude"].to(self.resonance_amplitude.device))
             
             # ===========================================================
             # 🔥 MOOD STATE
@@ -4240,10 +4419,10 @@ class DynamicPsycheCoreV6(nn.Module):
                         for param_group in self.controller_optimizer.param_groups:
                             for param in param_group['params']:
                                 if param in self.controller_optimizer.state:
-                                    state = self.controller_optimizer.state[param]
-                                    for key, value in state.items():
+                                    state_dict = self.controller_optimizer.state[param]
+                                    for key, value in state_dict.items():
                                         if isinstance(value, torch.Tensor) and value.device != device:
-                                            state[key] = value.to(device)
+                                            state_dict[key] = value.to(device)
                         logger.info("✅ Состояние оптимизатора контроллера загружено")
                     except Exception as e:
                         logger.warning(f"⚠ Ошибка загрузки оптимизатора: {e}")
@@ -4315,6 +4494,22 @@ class Thalia(GPT2LMHeadModel):
        
         self.tokenizer = None
         
+        # ===================================================================
+        # 🔥 SEMANTIC ANCHORS — стабилизация семантического пространства
+        # ===================================================================
+        self.num_anchors = getattr(config, 'num_anchors', 24)           # 16–32 оптимально
+        self.anchor_weight = getattr(config, 'anchor_weight', 0.0012)   # небольшой вес
+        
+        # Якоря — фиксированные опорные точки (не обучаются)
+        self.register_buffer('semantic_anchors', torch.randn(self.num_anchors, config.n_embd))
+        nn.init.orthogonal_(self.semantic_anchors)                     # ортогональные = максимальная независимость
+        
+        # Запоминаем исходную семантическую сигнатуру
+        self.register_buffer('initial_anchor_sims', None)
+        self._anchors_initialized = False
+        
+        logger.info(f"⚓ Semantic Anchors активированы: {self.num_anchors} ортогональных якорей")
+        
         # Hebb-память
         self.use_hebb_layers = getattr(config, 'use_hebb_layers', True)
         if self.use_hebb_layers:
@@ -4326,6 +4521,9 @@ class Thalia(GPT2LMHeadModel):
             if len(self.hebb_layers) > 0:
                 self.hebb_layers[0].log_init(len(self.hebb_layers))
             logger.info(f"🧠 Hebb-память (TEMPORAL v2.0): {config.n_layer} слоев")
+            
+            # 🔥 ВНЕДРЯЕМ HEBB ПРЯМО В БЛОКИ GPT-2
+            self._register_hebb_hooks()
         else:
             self.hebb_layers = None   
             
@@ -4389,9 +4587,121 @@ class Thalia(GPT2LMHeadModel):
             'controller_updated': deque(maxlen=10),
         }
         self.register_buffer("last_surprise", torch.tensor(0.0))
+        
+        # ===================================================================
+        # 🔥 EMBEDDING GRADIENT SCALING — архитектурная защита wte/wpe
+        # ===================================================================
+        if hasattr(self.transformer, 'wte'):
+            # Основные токен-эмбеддинги — самые "грязные" градиенты
+            self.transformer.wte.weight.register_hook(
+                lambda grad: grad * 0.08   # 12.5x ослабление — сладкая зона
+            )
+            logger.info("🛡️ Backward hook на wte: градиенты уменьшены в 12.5 раз")
+
+        if hasattr(self.transformer, 'wpe'):
+            # Позиционные эмбеддинги — можно мягче
+            self.transformer.wpe.weight.register_hook(
+                lambda grad: grad * 0.35
+            )
+            logger.info("🛡️ Backward hook на wpe: градиенты уменьшены в ~3 раза")
+        
+        # ===================================================================
+        # 🔥 DYNAMIC SELECTIVE BACKWARD HOOKS — прицельная защита горячих слоёв
+        # ===================================================================
+        if hasattr(self.transformer, 'h'):
+            total_layers = len(self.transformer.h)
+            
+            # Динамически вычисляем "горячую" середину (от 30% до 75% глубины)
+            # Для 12 слоев это будут слои с 3 по 8
+            start_idx = int(total_layers * 0.3)
+            end_idx = int(total_layers * 0.75)
+            
+            hot_layers = list(range(start_idx, end_idx))
+            
+            for i in hot_layers:
+                block = self.transformer.h[i]
+                
+                # Главный виновник — c_attn (query+key+value)
+                if hasattr(block.attn, 'c_attn'):
+                    block.attn.c_attn.weight.register_hook(lambda grad: grad * 0.25)
+                    if block.attn.c_attn.bias is not None:
+                        block.attn.c_attn.bias.register_hook(lambda grad: grad * 0.25)
+                
+                # c_proj тоже иногда шумит
+                if hasattr(block.attn, 'c_proj'):
+                    block.attn.c_proj.weight.register_hook(lambda grad: grad * 0.35)
+                
+                # MLP (c_fc + c_proj) — на всякий случай
+                if hasattr(block, 'mlp') and hasattr(block.mlp, 'c_fc'):
+                    block.mlp.c_fc.weight.register_hook(lambda grad: grad * 0.30)
+                
+                # c_proj в MLP тоже ослабляем
+                if hasattr(block, 'mlp') and hasattr(block.mlp, 'c_proj'):
+                    block.mlp.c_proj.weight.register_hook(lambda grad: grad * 0.30)
+            
+            logger.info(f"🛡️ Dynamic gradient scaling активирован для слоёв {hot_layers} (из {total_layers})")
                 
         logger.info(f"🧠 Thalia v9.1 с Hebb-памятью и темпоральным циклом инициализирована")
     
+    def parameters(self, recurse=True):
+        """
+        🔥 АВТО-ИЗОЛЯЦИЯ: Исключает personality_core из основного оптимизатора.
+        Психика обучается только внутренними механизмами (PPO/tick), 
+        чтобы не было конфликта градиентов с основным LM-лоссом.
+        """
+        for name, param in super().named_parameters(recurse=recurse):
+            # Исключаем всю психику, так как у неё свой оптимизатор и логика обновлений
+            if 'personality_core' not in name:
+                yield param
+
+    def _register_hebb_hooks(self):
+        """🔥 Внедряет Hebb-слои прямо в блоки GPT-2 через forward hooks"""
+        if not self.use_hebb_layers or self.hebb_layers is None:
+            return
+            
+        total_layers = len(self.transformer.h)
+        # Инициализируем хранилище для лоссов
+        self._hebb_aux_losses = [torch.tensor(0.0, device=self.config.device) for _ in range(total_layers)]
+            
+        for layer_idx, hebb_layer in enumerate(self.hebb_layers):
+            if layer_idx >= total_layers:
+                break
+                    
+            target_block = self.transformer.h[layer_idx]
+                    
+            def make_hook(hebb, idx):
+                def hook(module, args, output):
+                    # output в GPT-2 — это кортеж: (hidden_states, presents, attentions)
+                    hidden_states = output[0]
+                    
+                    # 🔥 Отсекаем градиенты для трансформера, 
+                    # чтобы память училась автономно, не ломая wte/wpe
+                    hebb_input = hidden_states.detach() 
+                    
+                    # Вызываем Hebb БЕЗ no_grad, чтобы его внутренний контроллер мог учиться!
+                    modified_hidden, aux_loss = hebb(
+                        hidden_states=hebb_input,
+                        attention_mask=None,
+                        # Динамические сигналы читаем из атрибутов модели
+                        surprise=getattr(self, 'current_surprise', 0.0), 
+                        signals=getattr(self, 'current_memory_controls', None)
+                    )
+                    
+                    # Сохраняем aux_loss (detach для хранения, но requires_grad остаётся)
+                    if aux_loss is not None and aux_loss.requires_grad:
+                        self._hebb_aux_losses[idx] = aux_loss
+                    else:
+                        self._hebb_aux_losses[idx] = torch.tensor(0.0, device=hidden_states.device)
+                    
+                    # 🔥 Возвращаем кортеж с модифицированным hidden_states
+                    return (modified_hidden,) + output[1:]
+                    
+                return hook
+                    
+            target_block.register_forward_hook(make_hook(hebb_layer, layer_idx))
+            
+        logger.info(f"🔗 Hebb-слои бесшовно интегрированы в {len(self.hebb_layers)} блоков GPT-2")
+ 
     def compute_alignment_losses(self):
         """Стабилизация всех пространств представлений"""
         losses = {}
@@ -4416,17 +4726,87 @@ class Thalia(GPT2LMHeadModel):
         
         return losses
 
+    def get_semantic_signature(self, embeddings: torch.Tensor) -> torch.Tensor:
+        """Возвращает семантическую подпись эмбеддингов относительно якорей"""
+        # embeddings: [batch, seq_len, dim] или [batch, dim]
+        if embeddings.dim() == 3:
+            embeddings = embeddings.mean(dim=1)          # усредняем по последовательности
+        
+        # Softmax по косинусной близости (температура 0.5 даёт чёткое распределение)
+        sim = F.softmax(embeddings @ self.semantic_anchors.T / 0.5, dim=-1)
+        return sim  # [batch, num_anchors]
+    
+    def compute_anchor_loss(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Anchor Loss — стабилизирует семантическое пространство"""
+        if input_ids is None:
+            return torch.tensor(0.0, device=self.device)
+        
+        # Получаем эмбеддинги токенов
+        embeddings = self.transformer.wte(input_ids)                    # [batch, seq, dim]
+        
+        # Текущая семантическая сигнатура
+        current_sims = self.get_semantic_signature(embeddings)
+        
+        # Инициализация при первом вызове
+        if not self._anchors_initialized:
+            self.initial_anchor_sims = current_sims.detach().clone()
+            self._anchors_initialized = True
+            return torch.tensor(0.0, device=embeddings.device)
+        
+        # MSE между текущей и исходной сигнатурой
+        anchor_loss = F.mse_loss(current_sims, self.initial_anchor_sims)
+        
+        return anchor_loss * self.anchor_weight
+
+    @torch.no_grad()
+    def sync_anchors_with_centroids(self):
+        """Синхронизирует якоря с самыми важными слотами центроидной памяти"""
+        if not hasattr(self, 'adaptive_memory') or self.adaptive_memory is None:
+            return
+        
+        centroid = self.adaptive_memory.centroid_memory
+        if not hasattr(centroid, 'centroids'):
+            return
+        
+        # Берём топ-N слотов по utility
+        if hasattr(centroid, 'slot_utility'):
+            top_k = min(self.num_anchors, centroid.num_slots)
+            _, top_indices = torch.topk(centroid.slot_utility, top_k)
+            
+            self.semantic_anchors.data = centroid.centroids[top_indices].clone()
+            # 🔥 СБРАСЫВАЕМ ЭТАЛОН — критически важно!
+            self.initial_anchor_sims = None
+            self._anchors_initialized = False
+            logger.info(f"⚓ Anchors синхронизированы с {top_k} топ-слотами центроидной памяти")
+        else:
+            logger.warning("⚠ slot_utility не найден в центроидной памяти")
+
     def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
         self.step_count += 1
         
+        # ===================================================================
+        # 🔥 Подготавливаем динамические сигналы для хуков
+        # ===================================================================
         if self.personality_core is not None:
             if self.training:
                 self.personality_core.tick(training=True)
             else:
                 self.personality_core.tick(training=False)
-        
+            
+            self.current_memory_controls = self.personality_core.get_memory_control_signals()
+        else:
+            self.current_memory_controls = None
+            
+        self.current_surprise = getattr(self, '_last_surprise', 0.0)
+
+        # Очищаем лоссы перед проходом
+        if hasattr(self, '_hebb_aux_losses'):
+            device = input_ids.device if input_ids is not None else self.config.device
+            for i in range(len(self._hebb_aux_losses)):
+                self._hebb_aux_losses[i] = torch.tensor(0.0, device=device)
+
         # ===================================================================
-        # 🔥🔥🔥 УРОВЕНЬ 1: Родной трансформер
+        # 🔥🔥🔥 УРОВЕНЬ 1: Родной трансформер (Hebb отрабатывает внутри хуков)
         # ===================================================================
         transformer_outputs = self.transformer(
             input_ids=input_ids,
@@ -4440,160 +4820,17 @@ class Thalia(GPT2LMHeadModel):
         attention_patterns = transformer_outputs.attentions
         all_hidden_states = list(transformer_outputs.hidden_states)
         
-        memory_controls = {}
-        if self.personality_core is not None:
-            memory_controls = self.personality_core.get_memory_control_signals()
-        
-        mamba_hidden_for_exchange = None
-        surprise = 0.0
-        base_surprise = 0.0
-        memory_result = {}
-        
         # ===================================================================
-        # 🔥🔥🔥 УРОВЕНЬ 2: HEBB + СИНХРОНИЗАЦИЯ ПАР ДЛЯ ALIGNMENT
+        # 🔥 Сбор aux_losses для градиентного шага контроллеров Hebb
         # ===================================================================
         total_hebb_aux_loss = torch.tensor(0.0, device=hidden_states.device)
-        hebb_novelty_boost = 0.0
-
-        if self.use_hebb_layers and self.hebb_layers is not None:
-            n_layers = len(self.hebb_layers)
-            group_filled = {0: 0, 1: 0, 2: 0}
-            group_capacity = {0: 0, 1: 0, 2: 0}
-            
-            for i, layer in enumerate(self.hebb_layers):
-                g_id = (i * 3) // max(n_layers, 1)
-                group_filled[g_id] += int(layer.initialized_slots.item())
-                group_capacity[g_id] += layer.num_slots
-            
-            group_ratios = {g: (group_filled[g] / group_capacity[g] if group_capacity[g] > 0 else 0.0) for g in range(3)}
-            
-            original_shape = hidden_states.shape
-            if self.step_count % 200 == 0:
-                logger.debug(f"🔍 original_shape: {original_shape}")
-            
-            for layer_idx, hebb_layer in enumerate(self.hebb_layers):
-                if layer_idx + 1 >= len(all_hidden_states):
-                    continue
-                    
-                layer_hidden = all_hidden_states[layer_idx + 1]
-                
-                if self.step_count % 200 == 0:
-                    logger.debug(f"🔍 layer_hidden[{layer_idx}].shape = {layer_hidden.shape}")
-                
-                g_id = (layer_idx * 3) // max(n_layers, 1)
-                
-                h_signals = {
-                    'write_gate': memory_controls.get('hebb_write_gate', 1.0),
-                    'lr_mult': memory_controls.get('hebb_lr_mult', 1.0),
-                    'stability_factor': memory_controls.get('stability_factor', 0.0),
-                    'attention_temperature': memory_controls.get('attention_temperature', None),
-                    'mood_influence': memory_controls.get('mood_influence', 0.0),
-                    'group_fill_ratio': group_ratios[g_id],
-                    'group_id': g_id
-                }
-                
-                if surprise > 0:
-                    h_signals['surprise'] = surprise
-                
-                hebb_result = hebb_layer(
-                    hidden_states=layer_hidden,
-                    signals=h_signals,
-                    attention_mask=attention_mask,
-                    surprise=surprise
-                )
-
-                if isinstance(hebb_result, tuple):
-                    modified_hidden, layer_aux = hebb_result
-                else:
-                    modified_hidden = hebb_result
-                    layer_aux = None
-                
-                if modified_hidden.dim() == 2 and layer_hidden.dim() == 3:
-                    batch_size = layer_hidden.shape[0]
-                    seq_len = layer_hidden.shape[1]
-                    hidden_dim = modified_hidden.shape[-1]
-                    expected_elements = batch_size * seq_len
-                    actual_elements = modified_hidden.shape[0]
-                    
-                    if expected_elements == actual_elements:
-                        modified_hidden = modified_hidden.view(batch_size, seq_len, hidden_dim)
-                        if self.step_count % 1000 == 0:
-                            logger.debug(f"Восстановлена размерность Hebb слоя {layer_idx}")
-                    else:
-                        logger.debug(f"Размерности не совпадают: {expected_elements} vs {actual_elements}")
-                        modified_hidden = layer_hidden
-                
-                all_hidden_states[layer_idx + 1] = modified_hidden
-                
-                if layer_aux is not None and layer_aux.requires_grad:
-                    total_hebb_aux_loss = total_hebb_aux_loss + torch.clamp(layer_aux, 0.0, 5.0)
-                    hebb_layer._controller_loss_for_backward = layer_aux
-                    if hasattr(hebb_layer, '_controller_loss'):
-                        hebb_layer._controller_loss = layer_aux.detach()
-                
-                if hasattr(hebb_layer, "new_slot_created_this_step") and hebb_layer.new_slot_created_this_step.item() == 1:
-                    hebb_novelty_boost += 0.25
-                    hebb_layer.new_slot_created_this_step.zero_()
-                    
-                    with torch.no_grad():
-                        query = getattr(hebb_layer, '_last_hebb_query', None)
-                        if query is not None and query.norm() > 0.01:
-                            if mamba_hidden_for_exchange is not None:
-                                if mamba_hidden_for_exchange.dim() == 3:
-                                    m_raw = mamba_hidden_for_exchange[:, -1, :].detach()
-                                elif mamba_hidden_for_exchange.dim() == 2:
-                                    m_raw = mamba_hidden_for_exchange.detach()
-                                else:
-                                    m_raw = mamba_hidden_for_exchange.view(-1, self.config.slot_size).detach()
-                            else:
-                                if attention_mask is not None:
-                                    mask = attention_mask.unsqueeze(-1).float()
-                                    m_raw = (hidden_states * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
-                                else:
-                                    m_raw = hidden_states.mean(dim=1)
-                                m_raw = m_raw.detach()
-                            
-                            self.experience_exchange.capture_pair(
-                                t_raw=query.unsqueeze(0),
-                                m_raw=m_raw.unsqueeze(0)
-                            )
-                            
-                            if self.step_count % 100 == 0:
-                                logger.debug(f"🔄 HebbLayer[{layer_idx}] → capture_pair (новый слот!)")
-            
-            if self.step_count % 500 == 0 and self.use_hebb_layers:
-                for i, layer in enumerate(self.hebb_layers):
-                    if i == 0 or i == len(self.hebb_layers)//2 or i == len(self.hebb_layers)-1:
-                        if hasattr(layer, 'analyze_network'):
-                            layer.analyze_network()
-                            if self.step_count % 1000 == 0:
-                                logger.info(f"🔬 Анализ Hebb слоя {i} выполнен")
-                        else:
-                            if hasattr(layer, 'initialized_slots') and hasattr(layer, 'num_slots'):
-                                filled = int(layer.initialized_slots.item())
-                                total = layer.num_slots
-                                ratio = filled / total if total > 0 else 0
-                                logger.info(f"🔬 Hebb слой {i}: {filled}/{total} слотов ({ratio:.1%})")
-            
-            hidden_states = all_hidden_states[-1]
-            
-            if hidden_states.dim() == 2:
-                expected_elements = original_shape[0] * original_shape[1]
-                actual_elements = hidden_states.shape[0]
-                
-                if expected_elements == actual_elements:
-                    hidden_states = hidden_states.view(original_shape)
-                else:
-                    logger.error(f"❌ Критическое несоответствие: {actual_elements} vs {expected_elements}")
-                    hidden_states = torch.zeros(original_shape, device=hidden_states.device, dtype=hidden_states.dtype)
-            
-            all_hidden_states = tuple(all_hidden_states)
-            
-            if self.step_count % 200 == 0:
-                logger.debug(f"🔍 После Hebb: hidden_states.shape = {hidden_states.shape}")
+        if hasattr(self, '_hebb_aux_losses'):
+            for aux_loss in self._hebb_aux_losses:
+                if isinstance(aux_loss, torch.Tensor) and aux_loss.requires_grad:
+                    total_hebb_aux_loss = total_hebb_aux_loss + torch.clamp(aux_loss, 0.0, 5.0)
         
         # ===================================================================
-        # УРОВЕНЬ 3: ЭМОЦИОНАЛЬНАЯ МОДУЛЯЦИЯ
+        # УРОВЕНЬ 2: ЭМОЦИОНАЛЬНАЯ МОДУЛЯЦИЯ
         # ===================================================================
         if self.personality_core is not None:
             hidden_states = self.personality_core.influence_hidden_states(hidden_states)
@@ -4603,31 +4840,31 @@ class Thalia(GPT2LMHeadModel):
             hidden_states = hidden_states + 0.15 * living_output
         
         # ===================================================================
-        # УРОВЕНЬ 4: ДОЛГОСРОЧНАЯ ПАМЯТЬ
+        # УРОВЕНЬ 3: ДОЛГОСРОЧНАЯ ПАМЯТЬ
         # ===================================================================
-        transformer_experience = None
-
-        if self.experience_exchange.bidirectional_enabled:
-            generation_metadata = {
-                'step': self.step_count,
-                'input_length': input_ids.shape[1] if input_ids is not None else 0,
-                'training': self.training,
-                'labels_provided': labels is not None,
-                'batch_size': hidden_states.shape[0]
-            }
-            
-            last_layer_attention = attention_patterns[-1] if attention_patterns else None
-            transformer_experience = None
-
-        final_control_signals = memory_controls.copy() if memory_controls else {}
-
-        if self.use_hebb_layers and self.hebb_layers is not None:
-            for layer in reversed(self.hebb_layers):
-                if hasattr(layer, '_last_hebb_query') and layer._last_hebb_query is not None:
-                    final_control_signals['hebb_query_vector'] = layer._last_hebb_query
-                    break
-
+        memory_controls = self.current_memory_controls or {}
+        mamba_hidden_for_exchange = None
+        base_surprise = 0.0
+        memory_result = {}
+        
         if self.adaptive_memory is not None:
+            transformer_experience = None
+            if self.experience_exchange.bidirectional_enabled:
+                generation_metadata = {
+                    'step': self.step_count,
+                    'input_length': input_ids.shape[1] if input_ids is not None else 0,
+                    'training': self.training,
+                    'labels_provided': labels is not None,
+                    'batch_size': hidden_states.shape[0]
+                }
+            
+            final_control_signals = memory_controls.copy() if memory_controls else {}
+            if self.use_hebb_layers and self.hebb_layers is not None:
+                for layer in reversed(self.hebb_layers):
+                    if hasattr(layer, '_last_hebb_query') and layer._last_hebb_query is not None:
+                        final_control_signals['hebb_query_vector'] = layer._last_hebb_query
+                        break
+            
             memory_result = self.adaptive_memory(
                 hidden_states=hidden_states,
                 slots=None,
@@ -4635,25 +4872,22 @@ class Thalia(GPT2LMHeadModel):
                 control_signals=final_control_signals
             )
             
-            # 🔥 ИСПРАВЛЕНИЕ: берём мета-лосс напрямую и НЕ сохраняем в переменную
             if 'meta_loss' in memory_result and memory_result['meta_loss'] is not None:
                 meta_loss_tensor = memory_result['meta_loss']
                 if isinstance(meta_loss_tensor, torch.Tensor) and meta_loss_tensor.requires_grad:
-                    # Сохраняем для добавления в общий loss
                     self._current_meta_loss = meta_loss_tensor
                     if self.step_count % 50 == 0:
-                        logger.info(f"🧠 Meta loss получен: {meta_loss_tensor.item():.6f} (requires_grad=True)")
+                        logger.info(f"🧠 Meta loss получен: {meta_loss_tensor.item():.6f}")
                 else:
                     self._current_meta_loss = None
             else:
                 self._current_meta_loss = None
             
-            # Извлекаем мета-когнитивную информацию
             if 'meta_cognitive' in memory_result:
                 self._last_meta = memory_result['meta_cognitive']
             
             base_surprise = memory_result.get('surprise', 0.0) if memory_result else 0.0
-            surprise = base_surprise + hebb_novelty_boost
+            surprise = base_surprise
             surprise = min(1.0, surprise)
             
             self.last_surprise.fill_(surprise)
@@ -4687,9 +4921,9 @@ class Thalia(GPT2LMHeadModel):
                         )
                 except Exception as e:
                     logger.debug(f"⚠ ingest_memory_experience: {e}")
-
+        
         # ===================================================================
-        # Синхронизированная запись пар для alignment
+        # УРОВЕНЬ 4: СИМБИОЗ И ОБМЕН ОПЫТОМ
         # ===================================================================
         if self.experience_exchange.bidirectional_enabled and mamba_hidden_for_exchange is not None:
             if attention_mask is not None:
@@ -4706,58 +4940,24 @@ class Thalia(GPT2LMHeadModel):
                 m_raw = mamba_hidden_for_exchange.view(-1, self.config.slot_size)
             
             if t_raw.shape[0] != m_raw.shape[0]:
-                if self.step_count % 200 == 0:
-                    logger.debug(f"⚠️ Выравнивание batch_size: t={t_raw.shape[0]}, m={m_raw.shape[0]}")
-                
                 min_batch = min(t_raw.shape[0], m_raw.shape[0])
-                
                 if min_batch > 0:
                     t_raw_aligned = t_raw[:min_batch]
                     m_raw_aligned = m_raw[:min_batch]
                     
-                    if not (torch.isnan(t_raw_aligned).any() or torch.isinf(t_raw_aligned).any() or 
+                    if not (torch.isnan(t_raw_aligned).any() or torch.isinf(t_raw_aligned).any() or
                             torch.isnan(m_raw_aligned).any() or torch.isinf(m_raw_aligned).any()):
-                        
                         t_raw_norm = F.normalize(t_raw_aligned, dim=-1)
                         m_raw_norm = F.normalize(m_raw_aligned, dim=-1)
-                        
                         self.experience_exchange.capture_pair(t_raw_norm, m_raw_norm)
-                        
-                        if self.step_count % 200 == 0:
-                            cos_sim = F.cosine_similarity(
-                                t_raw_norm.mean(dim=0, keepdim=True), 
-                                m_raw_norm.mean(dim=0, keepdim=True)
-                            ).item()
-                            logger.debug(f"📸 Захвачена пара (выровнена): batch={min_batch}, "
-                                       f"cos_sim={cos_sim:.4f}")
-                else:
-                    if self.step_count % 200 == 0:
-                        logger.warning(f"⚠️ Пропуск пары: min_batch={min_batch}")
             else:
-                if not (torch.isnan(t_raw).any() or torch.isinf(t_raw).any() or 
+                if not (torch.isnan(t_raw).any() or torch.isinf(t_raw).any() or
                         torch.isnan(m_raw).any() or torch.isinf(m_raw).any()):
-                    
                     t_raw_norm = F.normalize(t_raw, dim=-1)
                     m_raw_norm = F.normalize(m_raw, dim=-1)
-                    
                     self.experience_exchange.capture_pair(t_raw_norm, m_raw_norm)
-                    
-                    if self.step_count % 200 == 0:
-                        cos_sim = F.cosine_similarity(
-                            t_raw_norm.mean(dim=0, keepdim=True), 
-                            m_raw_norm.mean(dim=0, keepdim=True)
-                        ).item()
-                        logger.debug(f"📸 Захвачена пара: batch={t_raw.shape[0]}, cos_sim={cos_sim:.4f}")
-                else:
-                    if self.step_count % 200 == 0:
-                        logger.warning("⚠️ Пропуск пары: обнаружены NaN/Inf")
-                                
-        # ===================================================================
-        # УРОВЕНЬ 5: ИНТЕГРАЦИЯ И СИМБИОЗ
-        # ===================================================================
-        if self.experience_exchange.bidirectional_enabled:
-            exchange_mode = 'mutual_enhancement'
             
+            exchange_mode = 'mutual_enhancement'
             if not self.training:
                 if memory_result and memory_result.get('surprise', 0) > 0.3:
                     exchange_mode = 'mamba_filtering'
@@ -4771,161 +4971,111 @@ class Thalia(GPT2LMHeadModel):
             )
         
         # ===================================================================
-        # УРОВЕНЬ 6: ВЫХОД
+        # УРОВЕНЬ 5: ВЫХОД
         # ===================================================================
         lm_logits = self.lm_head(hidden_states)
         
+        # ===================================================================
+        # 🔥 ВЫЧИСЛЕНИЕ LOSS
+        # ===================================================================
         loss = None
         if labels is not None:
             shift_logits = lm_logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             
             if shift_logits.numel() > 0 and shift_labels.numel() > 0:
-                main_loss = F.cross_entropy(
-                    shift_logits.view(-1, shift_logits.size(-1)), 
+                ce_loss = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
                     shift_labels.view(-1),
-                    ignore_index=-100
+                    ignore_index=-100,
+                    reduction='none'
                 )
-                loss = main_loss
-        
-        # ===================================================================
-        # 🔥 ВЫЧИСЛЕНИЕ LOSS (исправленная версия с мета-когнитивным влиянием)
-        # ===================================================================
-        
-        if self.training and loss is not None:
-            # 1. Hebb aux loss
-            if total_hebb_aux_loss.numel() > 0 and total_hebb_aux_loss.requires_grad:
-                if total_hebb_aux_loss.dim() > 0:
-                    hebb_loss = total_hebb_aux_loss.sum()
-                else:
-                    hebb_loss = total_hebb_aux_loss
-                loss = loss + 0.01 * torch.clamp(hebb_loss, 0.0, 50.0)
                 
-                if self.step_count % 200 == 0:
-                    logger.info(f"📊 Hebb aux loss: {hebb_loss.item():.6f}")
+                batch_size = shift_logits.shape[0]
+                seq_len = shift_logits.shape[1]
+                ce_loss = ce_loss.view(batch_size, seq_len)
+                mask = (shift_labels != -100).float()
+                per_sample_loss = (ce_loss * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+                
+                max_weight = getattr(self.config, 'uncertainty_weight_max', 3.0)
+                if hasattr(self, '_last_meta') and self._last_meta is not None:
+                    confidence = self._last_meta.get('confidence')
+                    if confidence is not None:
+                        if isinstance(confidence, torch.Tensor) and confidence.shape[0] == batch_size:
+                            weights = 1.0 + (1.0 - confidence) * (max_weight - 1.0)
+                            weights = weights / weights.mean()
+                            per_sample_loss = per_sample_loss * weights
+                        elif isinstance(confidence, (float, int)):
+                            weight = 1.0 + (1.0 - confidence) * (max_weight - 1.0)
+                            per_sample_loss = per_sample_loss * weight
+                
+                loss = per_sample_loss.mean()
+        
+        # ===================================================================
+        # 🔥 ДОПОЛНИТЕЛЬНЫЕ LOSS КОМПОНЕНТЫ
+        # ===================================================================
+        if self.training and loss is not None:
+            if total_hebb_aux_loss.numel() > 0 and total_hebb_aux_loss.requires_grad:
+                hebb_loss = total_hebb_aux_loss.sum() if total_hebb_aux_loss.dim() > 0 else total_hebb_aux_loss
+                loss = loss + 0.01 * torch.clamp(hebb_loss, 0.0, 50.0)
             
-            # 2. Alignment losses
             try:
                 align_losses = self.compute_alignment_losses()
                 for loss_name, loss_value in align_losses.items():
                     if isinstance(loss_value, torch.Tensor) and loss_value.requires_grad:
                         loss = loss + loss_value * 0.02
-                        if self.step_count % 200 == 0:
-                            logger.info(f"✅ Added {loss_name} loss: {loss_value.item():.6f}")
             except Exception as e:
                 logger.debug(f"⚠ Alignment losses error: {e}")
             
-            # 3. Controller losses
-            controller_loss_total = torch.tensor(0.0, device=loss.device)
-            controller_count = 0
-            for layer in self.hebb_layers:
-                if hasattr(layer, '_controller_loss_for_backward') and layer._controller_loss_for_backward is not None:
-                    if isinstance(layer._controller_loss_for_backward, torch.Tensor) and layer._controller_loss_for_backward.requires_grad:
-                        controller_loss_total = controller_loss_total + layer._controller_loss_for_backward
-                        controller_count += 1
-                    layer._controller_loss_for_backward = None
-            
-            if controller_count > 0:
-                controller_loss_total = torch.clamp(controller_loss_total, min=0.0)
-                loss = loss + 0.01 * controller_loss_total
-                
-                if self.step_count % 200 == 0:
-                    logger.info(f"🎮 Controller losses total: {controller_loss_total.item():.6f} "
-                               f"({controller_count} layers)")
-            
-            # 4. 🔥 МЕТА-LOSS (от предиктора)
             if hasattr(self, '_current_meta_loss') and self._current_meta_loss is not None:
                 meta_loss_tensor = self._current_meta_loss
                 if isinstance(meta_loss_tensor, torch.Tensor) and meta_loss_tensor.requires_grad:
                     meta_coef = getattr(self.config, 'meta_loss_coef', 0.05)
                     loss = loss + meta_coef * meta_loss_tensor
-                    if self.step_count % 100 == 0:
-                        logger.info(f"🧠 Meta loss added: {meta_loss_tensor.item():.6f} (coef={meta_coef})")
                 self._current_meta_loss = None
             
-            # 5. 🔥 UNCERTAINTY-WEIGHTED LOSS (КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ)
-            if hasattr(self, '_last_meta') and self._last_meta is not None:
-                confidence = self._last_meta.get('confidence')
-                if confidence is not None:
-                    max_weight = getattr(self.config, 'uncertainty_weight_max', 3.0)
-                    
-                    if isinstance(confidence, torch.Tensor):
-                        # Убираем размерность batch, если нужно
-                        if confidence.dim() > 0 and confidence.shape[0] == 1:
-                            confidence = confidence.mean()
-                        
-                        loss_weights = 1.0 + (1.0 - confidence) * (max_weight - 1.0)
-                        
-                        if loss.dim() == 0:
-                            # loss уже скаляр
-                            loss = loss * loss_weights.mean()
-                            if self.step_count % 100 == 0:
-                                logger.info(f"🎯 Uncertainty-weighted (scalar): "
-                                           f"conf={confidence.mean().item() if confidence.dim() > 0 else confidence.item():.3f}, "
-                                           f"weight={loss_weights.mean().item():.3f}")
-                        elif loss.dim() > 0 and loss.shape[0] == loss_weights.shape[0]:
-                            # loss имеет размерность [batch]
-                            loss = (loss * loss_weights).mean()
-                            if self.step_count % 100 == 0:
-                                logger.info(f"🎯 Uncertainty-weighted (per-sample): "
-                                           f"conf={confidence.mean().item():.3f}, "
-                                           f"weight_mean={loss_weights.mean().item():.3f}")
-                        else:
-                            # fallback - используем средний вес
-                            loss = loss * loss_weights.mean()
-                            if self.step_count % 100 == 0:
-                                logger.warning(f"⚠ Uncertainty-weighted fallback: "
-                                              f"loss.dim={loss.dim()}, conf.shape={confidence.shape}")
-                    else:
-                        # confidence пришел как float
-                        uncertainty_weight = 1.0 + (1.0 - confidence) * (max_weight - 1.0)
-                        loss = loss * uncertainty_weight
-                        if self.step_count % 100 == 0:
-                            logger.info(f"🎯 Uncertainty-weighted (float): "
-                                       f"conf={confidence:.3f}, weight={uncertainty_weight:.3f}")
-            
-            # 6. 🔥 Repulsion loss из психики
-            if self.personality_core is not None and hasattr(self.personality_core, 'get_repulsion_loss'):
-                rep_loss = self.personality_core.get_repulsion_loss()
-                if isinstance(rep_loss, torch.Tensor) and rep_loss.requires_grad:
-                    rep_coef = getattr(self.config, 'repulsion_coef', 0.001)
-                    loss = loss + rep_coef * rep_loss
-                    if self.step_count % 200 == 0:
-                        logger.info(f"🔄 Repulsion loss: {rep_loss.item():.6f}")
-            
-            # 7. 🔥 Psyche regularization
             if self.personality_core is not None:
+                if hasattr(self.personality_core, 'get_repulsion_loss'):
+                    rep_loss = self.personality_core.get_repulsion_loss()
+                    if isinstance(rep_loss, torch.Tensor) and rep_loss.requires_grad:
+                        rep_coef = getattr(self.config, 'repulsion_coef', 0.001)
+                        loss = loss + rep_coef * rep_loss
+                
                 try:
                     if hasattr(self.personality_core, 'compute_regularization_loss'):
                         psyche_loss = self.personality_core.compute_regularization_loss()
                         if isinstance(psyche_loss, torch.Tensor) and psyche_loss.requires_grad:
                             psy_coef = getattr(self.config, 'psyche_coef', 0.05)
                             loss = loss + psy_coef * psyche_loss
-                            if self.step_count % 200 == 0:
-                                logger.info(f"🧠 Psyche loss: {psyche_loss.item():.6f}")
                 except Exception as e:
-                    logger.debug(f"⚠ Psyche loss error: {e}")        
+                    logger.debug(f"⚠ Psyche loss error: {e}")
+            
+            if memory_result:
+                if 'gate_aux_loss' in memory_result and memory_result['gate_aux_loss'] is not None:
+                    gate_loss = memory_result['gate_aux_loss']
+                    if isinstance(gate_loss, torch.Tensor) and gate_loss.requires_grad:
+                        loss = loss + 0.01 * torch.clamp(gate_loss, min=0.0)
+                
+                if 'gate_weights_aux_loss' in memory_result and memory_result['gate_weights_aux_loss'] is not None:
+                    weights_loss = memory_result['gate_weights_aux_loss']
+                    if isinstance(weights_loss, torch.Tensor) and weights_loss.requires_grad:
+                        loss = loss + 0.01 * weights_loss
         
-        if self.step_count % 200 == 0:
-            self._log_cognitive_state(memory_controls, memory_result, surprise, total_hebb_aux_loss)
-            
-            if loss is not None:
-                logger.info(f"📊 TOTAL LOSS: {loss.item():.6f}")
-            
-            if hebb_novelty_boost > 0:
-                logger.info(f"✨ Hebb novelty boost: {hebb_novelty_boost:.2f}")
-            
-            logger.info(f"🎯 Current surprise: {surprise:.4f} (base: {base_surprise:.4f}, boost: {hebb_novelty_boost:.2f})")
-            
-            # Логируем мета-когнитивную информацию
-            if hasattr(self, '_last_meta') and self._last_meta is not None:
-                confidence_val = self._last_meta.get('confidence', 0)
-                if isinstance(confidence_val, torch.Tensor):
-                    confidence_val = confidence_val.mean().item()
-                logger.info(f"🧠 Meta-cognitive: confidence={confidence_val:.3f}, "
-                           f"complexity={self._last_meta.get('complexity', 0):.3f}, "
-                           f"need_think={self._last_meta.get('need_think', False)}, "
-                           f"reflection_steps={self._last_meta.get('reflection_steps', 0)}")
+        # ===================================================================
+        # 🔥 SEMANTIC ANCHORS LOSS
+        # ===================================================================
+        if self.training and input_ids is not None and loss is not None and hasattr(self, 'semantic_anchors'):
+            try:
+                token_embeds = self.transformer.wte(input_ids)
+                anchor_loss = self.compute_anchor_loss(token_embeds)
+                if isinstance(anchor_loss, torch.Tensor) and anchor_loss.requires_grad:
+                    loss = loss + anchor_loss
+            except Exception as e:
+                if self.step_count % 500 == 0:
+                    logger.debug(f"⚠ Anchor loss error: {e}")
+        
+        if self.step_count % 200 == 0 and loss is not None:
+            logger.info(f"📊 TOTAL LOSS: {loss.item():.6f}")
         
         return CausalLMOutputWithCrossAttentions(
             loss=loss,
@@ -5026,9 +5176,13 @@ class Thalia(GPT2LMHeadModel):
                     n_blocks += 1
                 
                 if n_blocks > 0:
+                    # 🔥 Берём реальное количество слотов из первого слоя
+                    actual_slots_per_layer = self.hebb_layers[0].num_slots
+                    total_slots = n_blocks * actual_slots_per_layer
+                    
                     logger.info(
                         f"🧠 HEBB: active={total_active}/{total_initialized} "
-                        f"(init={total_initialized}/{n_blocks*64}), "
+                        f"(init={total_initialized}/{total_slots}), "  # ← теперь правильно
                         f"updates={total_updates}, reads={total_reads}, "
                         f"utility={total_utility/n_blocks:.3f}, "
                         f"surprise={surprise:.3f}, aux_loss={hebb_loss:.4f}"
@@ -5884,7 +6038,7 @@ class Thalia(GPT2LMHeadModel):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
         """
-        🔥 ИСПРАВЛЕННЫЙ from_pretrained с загрузкой мета-предиктора
+        🔥 ИСПРАВЛЕННЫЙ from_pretrained с загрузкой мета-предиктора и восстановлением hooks
         """
         import os
         
@@ -6047,6 +6201,31 @@ class Thalia(GPT2LMHeadModel):
                     logger.warning(f"⚠ Ошибка загрузки улучшенного состояния: {e}")
                     import traceback
                     logger.debug(traceback.format_exc())
+            
+            # ===========================================================
+            # 🔥 ВОССТАНАВЛИВАЕМ BACKWARD HOOKS ПОСЛЕ ЗАГРУЗКИ
+            # ===========================================================
+            if hasattr(model.transformer, 'wte'):
+                # 🔥 БЕЗОПАСНАЯ ОЧИСТКА: проверяем, существует ли _backward_hooks
+                if hasattr(model.transformer.wte.weight, '_backward_hooks'):
+                    if model.transformer.wte.weight._backward_hooks is not None:
+                        model.transformer.wte.weight._backward_hooks.clear()
+                # Регистрируем новый hook
+                model.transformer.wte.weight.register_hook(
+                    lambda grad: grad * 0.08
+                )
+                logger.info("🛡️ Backward hook на wte восстановлен после загрузки")
+
+            if hasattr(model.transformer, 'wpe'):
+                # 🔥 БЕЗОПАСНАЯ ОЧИСТКА: проверяем, существует ли _backward_hooks
+                if hasattr(model.transformer.wpe.weight, '_backward_hooks'):
+                    if model.transformer.wpe.weight._backward_hooks is not None:
+                        model.transformer.wpe.weight._backward_hooks.clear()
+                # Регистрируем новый hook
+                model.transformer.wpe.weight.register_hook(
+                    lambda grad: grad * 0.35
+                )
+                logger.info("🛡️ Backward hook на wpe восстановлен после загрузки")
             
             model = model.to(device)
             return model
