@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "thalia-ai"
-version = "0.9.0"  # 🔥 0.2.0 → 0.9.0
+version = "0.9.0"  
 description = "Thalia: Cognitive Architecture with Dynamic Psyche, Hebb Memory, PPO Neurocontroller and Self-Reflection"
 authors = [
     {name = "Secret", email = "secret@cognitive.arch"} 
@@ -19,7 +19,7 @@ classifiers = [
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
-    "Topic :: Philosophy",  # 🔥 добавил!
+    "Topic :: Philosophy",  
 ]
 requires-python = ">=3.8"
 dependencies = [
@@ -34,7 +34,7 @@ dependencies = [
     "datasets",
     "ddgs",
     "langchain",
-    "gradio",  # 🔥 переместил из dev (нужен для интерфейса)
+    "gradio",  
 ]
 
 [project.optional-dependencies]
@@ -43,10 +43,10 @@ dev = [
     "matplotlib",
     "seaborn",
     "streamlit",
-    "pytest",   # 🔥 добавил
-    "black",    # 🔥 добавил
+    "pytest",   
+    "black",    
 ]
-philosophy = [  # 🔥 новый раздел
+philosophy = [  
     "markdown",
     "pypandoc",
 ]
@@ -54,13 +54,12 @@ philosophy = [  # 🔥 новый раздел
 [project.scripts]
 thalia-create = "thalia.create_model:main"
 thalia-gui = "thalia.interface:launch_gui"
-thalia-think = "thalia.philosophy:reflect"  # 🔥 новая команда для философских размышлений
+thalia-think = "thalia.philosophy:reflect"  
 
 [tool.setuptools]
 include-package-data = true
 zip-safe = false
 
-# 🔥 добавил конфигурацию для линтеров
 [tool.black]
 line-length = 100
 target-version = ['py38']
