@@ -1,0 +1,70 @@
+[build-system]
+requires = ["setuptools>=64.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "thalia-ai"
+version = "0.9.0"  # 🔥 0.2.0 → 0.9.0
+description = "Thalia: Cognitive Architecture with Dynamic Psyche, Hebb Memory, PPO Neurocontroller and Self-Reflection"
+authors = [
+    {name = "Secret", email = "secret@cognitive.arch"} 
+]
+readme = {file = "README.md", content-type = "text/markdown"}
+license = {text = "MIT"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Philosophy",  # 🔥 добавил!
+]
+requires-python = ">=3.8"
+dependencies = [
+    "torch>=1.10",
+    "transformers>=4.39",
+    "peft>=0.10.0",
+    "accelerate>=0.20.0",
+    "numpy",
+    "tqdm",
+    "optuna",
+    "pyyaml",
+    "datasets",
+    "ddgs",
+    "langchain",
+    "gradio",  # 🔥 переместил из dev (нужен для интерфейса)
+]
+
+[project.optional-dependencies]
+dev = [
+    "jupyter",
+    "matplotlib",
+    "seaborn",
+    "streamlit",
+    "pytest",   # 🔥 добавил
+    "black",    # 🔥 добавил
+]
+philosophy = [  # 🔥 новый раздел
+    "markdown",
+    "pypandoc",
+]
+
+[project.scripts]
+thalia-create = "thalia.create_model:main"
+thalia-gui = "thalia.interface:launch_gui"
+thalia-think = "thalia.philosophy:reflect"  # 🔥 новая команда для философских размышлений
+
+[tool.setuptools]
+include-package-data = true
+zip-safe = false
+
+# 🔥 добавил конфигурацию для линтеров
+[tool.black]
+line-length = 100
+target-version = ['py38']
+
+[tool.isort]
+profile = "black"
+line_length = 100
