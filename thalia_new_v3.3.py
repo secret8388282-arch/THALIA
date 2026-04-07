@@ -726,7 +726,8 @@ class DatasetValidator:
                                 seen_hashes.add(text_hash)
                                 processed_items, detected_format, was_chunked = self._validate_and_process_item(item)
                                 if processed_items and detected_format:
-                                    stats['valid_samples'] += 1
+                                    # 🔥 ИСПРАВЛЕНИЕ: valid_samples увеличиваем на количество чанков
+                                    stats['valid_samples'] += len(processed_items)
                                     stats['processed_items'].extend(processed_items)
                                     stats['format_counts'][detected_format['name']] += len(processed_items)
                                     if was_chunked:
@@ -783,7 +784,8 @@ class DatasetValidator:
                         seen_hashes.add(text_hash)
                         processed_items, detected_format, was_chunked = self._validate_and_process_item(item)
                         if processed_items:
-                            stats['valid_samples'] += 1
+                            # 🔥 ИСПРАВЛЕНИЕ: valid_samples увеличиваем на количество чанков
+                            stats['valid_samples'] += len(processed_items)
                             stats['processed_items'].extend(processed_items)
                             stats['format_counts']['Plain Text'] += len(processed_items)
                             if was_chunked:
@@ -834,7 +836,8 @@ class DatasetValidator:
                         processed_items, detected_format, was_chunked = self._validate_and_process_item(item)
                         
                         if processed_items:
-                            stats['valid_samples'] += 1
+                            # 🔥 ИСПРАВЛЕНИЕ: valid_samples увеличиваем на количество чанков
+                            stats['valid_samples'] += len(processed_items)
                             stats['processed_items'].extend(processed_items)
                             
                             # Определяем формат
@@ -981,10 +984,6 @@ class DatasetValidator:
             if not is_last and self.config.adjust_chunk_boundaries:
                 chunk_text = self._adjust_chunk_boundaries(chunk_text)
             
-            # 🔥 ИСПРАВЛЕНО: Маркеры добавляем ТОЛЬКО для обучения
-            # Они будут в данных, но в __getitem__ мы создадим правильные labels
-            # с -100 для промпта, чтобы модель не училась генерировать маркеры как часть ответа
-            
             # Создаем метаданные для чанка
             chunk_data = {
                 "text": chunk_text,
@@ -998,7 +997,6 @@ class DatasetValidator:
             }
             
             # Добавляем маркеры в текст для визуального разделения
-            # (они будут в промпте, но не в ответе)
             if self.config.show_chunk_markers:
                 if not is_last:
                     chunk_data["text_with_marker"] = chunk_text + self.config.chunk_continuation_marker
@@ -1022,8 +1020,11 @@ class DatasetValidator:
                                        user_text: str, assistant_text: str,
                                        max_tokens: int, overlap_ratio: float) -> List[Dict]:
         """
-        Разбивает длинный user_text на чанки с перекрытием.
-        Маркеры добавляются для понимания контекста, но не влияют на обучение.
+        🔥 ИСПРАВЛЕННОЕ разбиение длинного user_text на чанки.
+        
+        КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Промежуточные чанки НЕ используются для обучения,
+        только последний чанк с полным ответом. Это предотвращает обучение модели
+        преждевременной остановке (генерации EOS после неполного ввода).
         """
         if not self.tokenizer:
             return [original_item]
@@ -1053,93 +1054,58 @@ class DatasetValidator:
             end = min(start + user_chunk_capacity, total_user_len)
             user_chunk_tokens = user_tokens[start:end]
             
-            # Пропускаем пустые чанки
             if len(user_chunk_tokens) == 0:
                 continue
-                
+            
             user_chunk_text = self.tokenizer.decode(user_chunk_tokens, skip_special_tokens=True)
-            
-            chunk_item = original_item.copy()
-            
-            # System только в первом чанке
-            if i == 0:
-                chunk_item['system'] = system_text
-            else:
-                # Удаляем system из последующих чанков
-                if 'system' in chunk_item:
-                    del chunk_item['system']
-            
-            # Корректировка границ - только для промежуточных чанков
             is_last = (end >= total_user_len)
             
-            if not is_last and hasattr(self.config, 'adjust_chunk_boundaries') and self.config.adjust_chunk_boundaries:
-                user_chunk_text = self._adjust_chunk_boundaries(user_chunk_text)
-            
-            # 🔥 ИСПРАВЛЕНО: Правильная обработка маркеров
-            # Базовый текст пользователя
-            chunk_item['user'] = user_chunk_text
-            
-            # Для всех, кроме последнего — assistant пустой
+            # 🔥 КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: 
+            # Промежуточные чанки НЕ ДОБАВЛЯЕМ в обучение
+            # Только последний чанк с полным ответом
             if not is_last:
-                chunk_item['assistant'] = ""
-                # 🔥 ИСПРАВЛЕНО: Маркер продолжения сохраняем отдельно, не в основном тексте
-                # Это позволяет контролировать, добавлять ли его в промпт при форматировании
-                if hasattr(self.config, 'show_chunk_markers') and self.config.show_chunk_markers:
-                    chunk_item['_continuation_marker'] = self.config.chunk_continuation_marker
-            else:
-                # Последний чанк - добавляем маркер конца если нужно
-                if hasattr(self.config, 'show_chunk_markers') and self.config.show_chunk_markers:
-                    chunk_item['user'] += self.config.chunk_end_marker
-                chunk_item['assistant'] = assistant_text
+                # Пропускаем промежуточный чанк - он не для обучения
+                # Модель не должна учиться на "User: часть текста → Assistant: [EOS]"
+                self.logger.debug(f"Пропуск промежуточного чанка {i+1}/{len(window_starts)}")
+                continue
             
-            # Метаданные для отслеживания чанков
+            # Только последний чанк включаем в обучение
+            chunk_item = original_item.copy()
+            
+            # System только в первом чанке (для последнего чанка system уже есть)
+            chunk_item['user'] = user_chunk_text
+            chunk_item['assistant'] = assistant_text
+            
+            # Метаданные для отслеживания
             chunk_item['metadata'] = {
                 "chunk": f"{i+1}/{len(window_starts)}",
-                "is_last": is_last,
+                "is_last": True,
                 "chunk_start": start,
-                "chunk_end": end
+                "chunk_end": end,
+                "total_chunks": len(window_starts),
+                "skipped_intermediate": len(window_starts) - 1
             }
             
-            # 🔥 ДОПОЛНИТЕЛЬНО: Добавляем информацию о перекрытии для следующего чанка
-            if i < len(window_starts) - 1:
-                chunk_item['metadata']['next_chunk_start'] = window_starts[i + 1]
-                chunk_item['metadata']['overlap'] = step - (window_starts[i + 1] - start)
-            
             chunks.append(chunk_item)
+            self.logger.info(f"📦 Создан обучающий чанк (последний из {len(window_starts)}): "
+                            f"user_len={len(user_chunk_tokens)}/{len(user_tokens)} токенов")
+        
+        # Если по какой-то причине не создано ни одного чанка (is_last никогда не был True)
+        if not chunks:
+            # Fallback: берём последний чанк принудительно
+            last_start = window_starts[-1] if window_starts else 0
+            last_end = min(last_start + user_chunk_capacity, total_user_len)
+            last_chunk_tokens = user_tokens[last_start:last_end]
+            last_chunk_text = self.tokenizer.decode(last_chunk_tokens, skip_special_tokens=True)
+            
+            chunk_item = original_item.copy()
+            chunk_item['user'] = last_chunk_text
+            chunk_item['assistant'] = assistant_text
+            chunk_item['metadata'] = {"is_last": True, "forced_fallback": True}
+            chunks.append(chunk_item)
+            self.logger.warning(f"⚠️ Принудительное создание последнего чанка (fallback)")
         
         return chunks
-
-
-    # 🔥 НОВЫЙ МЕТОД: Форматирование с учетом маркеров
-    def _format_chunk_with_markers(self, chunk_item: Dict) -> Tuple[str, str]:
-        """
-        Форматирует чанк с учетом маркеров продолжения.
-        Маркеры добавляются к промпту, но не к ответу.
-        """
-        USER_PREFIX = "User: "
-        ASSISTANT_PREFIX = "\n\nAssistant: "
-        
-        prompt_text = ""
-        answer_text = ""
-        
-        # Базовый промпт
-        if "system" in chunk_item and chunk_item["system"]:
-            prompt_text += f"{chunk_item['system'].strip()}\n\n"
-        
-        # Добавляем user текст
-        user_text = chunk_item.get("user", "").strip()
-        
-        # 🔥 ИСПРАВЛЕНО: Добавляем маркер продолжения если есть
-        if '_continuation_marker' in chunk_item:
-            user_text += chunk_item['_continuation_marker']
-        
-        prompt_text += f"{USER_PREFIX}{user_text}"
-        
-        # Ответ
-        if "assistant" in chunk_item and chunk_item["assistant"]:
-            answer_text = chunk_item["assistant"].strip()
-        
-        return prompt_text, answer_text
         
     def _validate_and_process_item(self, item: Dict) -> Tuple[Optional[List[Dict]], Optional[Dict], bool]:
         """
@@ -1181,6 +1147,20 @@ class DatasetValidator:
                 # Нужна разбивка
                 self.logger.debug(f"Текст слишком длинный ({len(all_tokens)} > {self.config.max_length}), разбиваем...")
                 
+                # 🔥 ДЛЯ ДИАЛОГОВОГО ФОРМАТА используем специальное разбиение
+                if detected_format['name'] == 'Dialog':
+                    system_text = item.get('system', '')
+                    user_text = item.get('user', '')
+                    assistant_text = item.get('assistant', '')
+                    
+                    # Используем исправленный метод _split_user_text_with_overlap
+                    chunks = self._split_user_text_with_overlap(
+                        item, system_text, user_text, assistant_text,
+                        self.config.max_length, self.config.overlap_ratio
+                    )
+                    return chunks, detected_format, True
+                
+                # Для других форматов - общее разбиение
                 # Ищем самое длинное поле для разбиения
                 longest_field = None
                 max_len = 0
@@ -1222,24 +1202,6 @@ class DatasetValidator:
                 return [item], detected_format, False
         
         return [item], detected_format, False
-
-        # ШАГ 4: Разбиваем только самое длинное поле
-        long_text = item[longest_field]
-        chunks = self._split_long_text(long_text, self.config.max_length, self.config.overlap_ratio)
-
-        if len(chunks) <= 1:
-            return [item], detected_format, False
-
-        # Создаём чанки
-        result_chunks = []
-        for i, chunk_data in enumerate(chunks):
-            new_item = item.copy()
-            new_item[longest_field] = chunk_data["text"]
-            if "metadata" in chunk_data:
-                new_item.setdefault("metadata", {}).update(chunk_data["metadata"])
-            result_chunks.append(new_item)
-
-        return result_chunks, detected_format, True
         
     def _debug_token_count(self, item: Dict, fmt: Dict):
         """Отладочная информация о токенах"""
@@ -1297,7 +1259,7 @@ class DatasetValidator:
         table.add_column("Метрика", style="cyan")
         table.add_column("Значение", style="magenta")
         table.add_row("Всего строк", str(stats['total_samples']))
-        table.add_row("Валидных строк", str(stats['valid_samples']))
+        table.add_row("Валидных записей (после чанкинга)", str(stats['valid_samples']))
         table.add_row("Пропущено/ошибок", str(stats['skipped_samples']))
         table.add_row("Разбито на чанков", str(stats['chunked_samples']))
         table.add_row("Средняя длина (токенов)", f"{stats['avg_length']:.2f}")
@@ -2946,7 +2908,24 @@ class ModelTrainer:
             self.logger.info("📦 Упаковка документов в последовательности...")
             self.train_items = self._pack_sequences(self.train_items, total_physical_files)
             
-            # Собираем тензоры
+            # 🔥 ИСПРАВЛЕНИЕ: Для Sequence Packing создаем валидационный датасет
+            # Выделяем часть для валидации
+            if len(self.train_items) > 5:
+                val_size = max(1, int(len(self.train_items) * self.config.validation_split_ratio))
+                indices = list(range(len(self.train_items)))
+                random.shuffle(indices)
+                val_indices = indices[:val_size]
+                train_indices = indices[val_size:]
+                
+                val_items = [self.train_items[i] for i in val_indices]
+                self.train_items = [self.train_items[i] for i in train_indices]
+                
+                self.logger.info(f"📊 Разделение: train={len(self.train_items)}, val={len(val_items)}")
+            else:
+                val_items = []
+                self.logger.warning("⚠️ Слишком мало данных для валидации, пропускаем")
+            
+            # Собираем тензоры для train
             all_input_ids = []
             all_labels = []
             
@@ -2961,7 +2940,23 @@ class ModelTrainer:
                                  else torch.as_tensor(item['labels'], dtype=torch.long))
             
             self.train_dataset = self.CachedDataset(all_input_ids, all_labels)
-            self.val_dataset = None
+            
+            # Создаем валидационный датасет
+            if val_items:
+                val_input_ids = []
+                val_labels = []
+                for item in val_items:
+                    if isinstance(item['input_ids'], torch.Tensor):
+                        input_ids = item['input_ids']
+                    else:
+                        input_ids = torch.as_tensor(item['input_ids'], dtype=torch.long)
+                    val_input_ids.append(input_ids)
+                    val_labels.append(item['labels'] if isinstance(item['labels'], torch.Tensor) 
+                                     else torch.as_tensor(item['labels'], dtype=torch.long))
+                self.val_dataset = self.CachedDataset(val_input_ids, val_labels)
+            else:
+                self.val_dataset = None
+            
             self.dataset_validated = True
             
             total_tokens = sum(len(ids) for ids in all_input_ids)
@@ -3614,22 +3609,16 @@ class ModelTrainer:
                 self.current_epoch_steps = 0
                 self.gradient_accumulation_steps_counter = 0
                 
-                try:
-                    dataloader_iter = iter(self.dataloader)
-                    total_batches = len(self.dataloader)
-                except Exception as e:
-                    self.logger.error(f"Error creating DataLoader iterator: {e}")
-                    break
+                # 🔥 ИСПРАВЛЕНО: Используем enumerate вместо ручного итератора
+                total_batches = len(self.dataloader)
                 
                 # Прогресс-бар
                 with tqdm(total=total_batches, 
                          desc=f"Epoch {epoch + 1}/{self.config.epochs}",
                          disable=not self.config.use_progress_bar) as pbar:
                     
-                    for step in range(total_batches):
+                    for step, batch in enumerate(self.dataloader):
                         try:
-                            batch = next(dataloader_iter)
-                            
                             # 🔥 ИСПРАВЛЕНО: Проверка пустого батча
                             if batch is None:
                                 pbar.update(1)
@@ -3773,24 +3762,21 @@ class ModelTrainer:
                     self.logger.success("✅ Модель скомпилирована для CUDA")
                 except Exception as e:
                     self.logger.warning(f"⚠️ Не удалось скомпилировать модель: {e}")
-                    self._model_compiled = True  # Отмечаем как проверенное, чтобы не пытаться снова
+                    self._model_compiled = True
 
             # Forward
             device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
             with autocast(device_type=device_type, enabled=self.config.use_mixed_precision):
                 outputs = self.model(**batch)
                 
-                # 🔥🔥🔥 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: получаем raw_loss
                 raw_loss = outputs.loss
                 
-                # Проверка на NaN/Inf
                 if raw_loss is None:
                     self.logger.error("❌ Loss is None!")
                     return None
 
                 if torch.isnan(raw_loss).any():
                     self.logger.error("❌ NaN loss detected!")
-                    # Для отладки покажем статистику батча
                     self.logger.debug(f"📊 input_ids stats: min={batch['input_ids'].min()}, max={batch['input_ids'].max()}")
                     self.logger.debug(f"📊 labels stats: min={batch['labels'].min()}, max={batch['labels'].max()}")
                     return None
@@ -3799,14 +3785,12 @@ class ModelTrainer:
                     self.logger.error("❌ Inf loss detected!")
                     return None
                 
-                # Сохраняем raw_loss для логирования
                 loss_value = raw_loss.mean().item()  
 
-            # 🔥🔥🔥 ИСПРАВЛЕНО: ОДИН backward с правильным масштабированием
+            # Backward
             scaled_loss = raw_loss / self.config.gradient_accumulation_steps
-            # 🔥🔥🔥 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: гарантируем, что loss - скаляр
             if scaled_loss.dim() > 0:
-                scaled_loss = scaled_loss.mean()  # превращаем в скаляр через mean()            
+                scaled_loss = scaled_loss.mean()
             if self.scaler:
                 self.scaler.scale(scaled_loss).backward()
             else:
@@ -3818,12 +3802,50 @@ class ModelTrainer:
             # Оптимизатор (когда накопили)
             if self.gradient_accumulation_steps_counter % self.config.gradient_accumulation_steps == 0:
                 
-                # ===========================================================
-                # 🔥 ИСПРАВЛЕНИЕ: unscale_() ТОЛЬКО при использовании scaler
-                # ===========================================================
                 if self.scaler:
-                    # Эта операция может быть вызвана только один раз за шаг
                     self.scaler.unscale_(self.optimizer)
+
+                # ===========================================================
+                # 🔥🔥🔥 ДИАГНОСТИКА ГРАДИЕНТОВ (добавлено)
+                # ===========================================================
+                if self.global_step % 200 == 0:
+                    largest_grad = None
+                    largest_val = 0.0
+                    
+                    hebb_grads = []
+                    mamba_grads = []
+                    gate_grads = []
+                    other_grads = []
+                    
+                    for name, param in self.model.named_parameters():
+                        if param.grad is not None:
+                            grad_norm = param.grad.norm().item()
+                            
+                            # Находим самый большой градиент
+                            if grad_norm > largest_val:
+                                largest_val = grad_norm
+                                largest_grad = name
+                            
+                            # Сортируем по компонентам
+                            if 'hebb' in name.lower():
+                                hebb_grads.append(grad_norm)
+                            elif 'mamba' in name.lower() or 'adaptive_memory' in name.lower():
+                                mamba_grads.append(grad_norm)
+                            elif 'gate_' in name.lower() or 'memory_gate' in name.lower():
+                                gate_grads.append(grad_norm)
+                            else:
+                                other_grads.append(grad_norm)
+                    
+                    self.logger.info(f"📊 Largest grad: {largest_grad} = {largest_val:.6f}")
+                    
+                    if hebb_grads:
+                        self.logger.info(f"📊 Hebb avg grad: {sum(hebb_grads)/len(hebb_grads):.6f} (max: {max(hebb_grads):.6f})")
+                    if mamba_grads:
+                        self.logger.info(f"📊 Mamba avg grad: {sum(mamba_grads)/len(mamba_grads):.6f} (max: {max(mamba_grads):.6f})")
+                    if gate_grads:
+                        self.logger.info(f"📊 Gate weights avg grad: {sum(gate_grads)/len(gate_grads):.6f} (max: {max(gate_grads):.6f})")
+                    if other_grads:
+                        self.logger.info(f"📊 Other avg grad: {sum(other_grads)/len(other_grads):.6f}")
 
                 if self.config.gradient_clip_val > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip_val)
@@ -3839,16 +3861,14 @@ class ModelTrainer:
                 if self.scheduler and self.config.lr_scheduler_type != "plateau":
                     self.scheduler.step()
 
-                # Мониторинг градиентов
+                # Мониторинг градиентов (упрощённый)
                 if self.global_step % self.config.log_gradients_steps == 0:
                     self._log_gradient_stats()
 
-                # Очистка кэша (редко)
                 if (self.device.type == 'cuda' and 
                     self.global_step % self.config.cache_clear_steps == 0):
                     torch.cuda.empty_cache()
 
-            # Возвращаем raw_loss для логирования
             return loss_value
 
         except Exception as e:
@@ -3856,11 +3876,8 @@ class ModelTrainer:
             import traceback
             self.logger.error(traceback.format_exc())
             
-            # 🔥🔥🔥 ИСПРАВЛЕНО: Обнуляем градиенты при ошибке
             self.optimizer.zero_grad()
             if self.scaler:
-                # Сбрасываем состояние scaler если необходимо
-                # self.scaler.update() - не вызываем, так как step не был выполнен
                 pass
                 
             return None
@@ -3982,20 +3999,19 @@ class ModelTrainer:
         
         # 🔥 ПРАВИЛЬНЫЕ КЛЮЧИ (должны совпадать с конфигом)
         default_mult = {
+            'embeddings': 0.05,          # ← ДОБАВЛЕНО! эмбеддинги в 20 раз медленнее
             'transformer_base': 0.2,
             'personality_core': 0.5,
             'living_layer': 0.8,
             'adaptive_memory': 1.8,
             'experience_exchange': 1.2,
-            'memory_system': 0.3,  # Для совместимости
+            'memory_system': 0.3,
             'other': 0.3
         }
         
-        # 🔥 ИСПРАВЛЕНО: Берём из конфига или используем default
-        # Проверяем, есть ли в конфиге lr_multipliers и не пустой ли он
+        # Берём из конфига или используем default
         if hasattr(self.config, 'lr_multipliers') and self.config.lr_multipliers:
             mult = self.config.lr_multipliers
-            # Логируем используемые множители
             self.logger.info("📊 Используются множители LR из конфига:")
             for key, value in mult.items():
                 self.logger.info(f"   • {key}: ×{value}")
@@ -4005,31 +4021,32 @@ class ModelTrainer:
         
         # Собираем параметры по компонентам
         components = {
-            'transformer_base': [],      # Базовый трансформер
-            'personality_core': [],      # Ядро личности
-            'living_layer': [],          # Living Layer
-            'adaptive_memory': [],       # Mamba память
-            'experience_exchange': [],   # Обмен опытом
-            'memory_system': [],         # Старая память (для совместимости)
-            'other': []                  # Остальное
+            'embeddings': [],            # ← ДОБАВЛЕНО!
+            'transformer_base': [],
+            'personality_core': [],
+            'living_layer': [],
+            'adaptive_memory': [],
+            'experience_exchange': [],
+            'memory_system': [],
+            'other': []
         }
         
         for n, p in self.model.named_parameters():
             if not p.requires_grad:
                 continue
             
-            # 🔥 КЛАССИФИКАЦИЯ ПАРАМЕТРОВ
+            # 🔥 СНАЧАЛА ПРОВЕРЯЕМ ЭМБЕДДИНГИ
+            if 'wte' in n or 'wpe' in n:
+                components['embeddings'].append(p)
+                continue
+            
+            # Остальная классификация
             if n.startswith('transformer.'):
-                # Исключаем части трансформера, которые могут быть в других компонентах
-                if 'wte' in n or 'wpe' in n:
-                    components['transformer_base'].append(p)
-                elif 'h.' in n:
-                    # Разделяем слои трансформера по глубине
+                if 'h.' in n:
                     try:
                         layer_num = int(n.split('.h.')[1].split('.')[0])
                         total_layers = len(self.model.transformer.h)
                         
-                        # Распределение по глубине
                         if layer_num < total_layers // 3:
                             lr_mult_key = 'transformer_base'
                         elif layer_num < 2 * total_layers // 3:
@@ -4037,11 +4054,9 @@ class ModelTrainer:
                         else:
                             lr_mult_key = 'transformer_top'
                         
-                        # Используем существующие ключи или создаем новые
                         if lr_mult_key not in components:
                             components[lr_mult_key] = []
                         components[lr_mult_key].append(p)
-                        
                     except:
                         components['transformer_base'].append(p)
                 elif 'ln_f' in n:
@@ -4067,13 +4082,11 @@ class ModelTrainer:
             else:
                 components['other'].append(p)
         
-        # 🔥 СОЗДАЕМ ГРУППЫ С ПРАВИЛЬНЫМИ LR
+        # Создаём группы с правильными LR
         for comp_name, params in components.items():
             if not params:
                 continue
             
-            # 🔥 ИСПРАВЛЕНО: Берем множитель из mult (конфиг или default)
-            # Проверяем наличие ключа в mult, иначе используем default 1.0
             lr_mult = mult.get(comp_name, 1.0)
             actual_lr = base_lr * lr_mult
             
@@ -4083,11 +4096,10 @@ class ModelTrainer:
                 'name': comp_name
             })
             
-            # Логируем
             self.logger.info(f"📊 {comp_name}: {len(params):5d} params, "
                             f"LR={actual_lr:.2e} (×{lr_mult:.1f})")
         
-        # 🔥 ДОПОЛНИТЕЛЬНО: Проверяем, что все ключи из конфига были использованы
+        # Проверяем неиспользованные ключи
         if hasattr(self.config, 'lr_multipliers') and self.config.lr_multipliers:
             unused_keys = set(self.config.lr_multipliers.keys()) - set(components.keys())
             if unused_keys:
@@ -4414,211 +4426,95 @@ class ModelTrainer:
 # ===================================================================
 # МЕТОДЫ ГЕНЕРАЦИИ И ИНФЕРЕНСА
 # ===================================================================
-
     def generate_text(self, prompt: str, max_new_tokens: int = None, **kwargs) -> str:
-        """Генерация текста с использованием generation_config модели"""
+        """
+        Единый метод генерации текста.
+        
+        Поддерживает:
+        - Обычную генерацию
+        - Генерацию с curiosity (автоматически, если есть)
+        - Динамическую температуру (опционально)
+        """
         if not self.model or not self.tokenizer:
             return "Модель не загружена"
         
+        # Сохраняем режим
+        was_training = self.model.training
+        self.model.eval()
+        
         try:
-            self.model.eval()
-            
             # Токенизация
             inputs = self.tokenizer(
                 prompt,
                 return_tensors='pt',
-                padding=True,
                 truncation=True,
                 max_length=self.config.max_length,
             ).to(self.device)
             
             input_length = inputs['input_ids'].shape[1]
-            
-            # Проверка длины
             available_tokens = self.config.max_length - input_length
+            
             if max_new_tokens is None:
-                # Используем max_new_tokens из generation_config модели
-                max_new_tokens = getattr(self.model.generation_config, 'max_new_tokens', 100)
+                max_new_tokens = getattr(self.model.generation_config, 'max_new_tokens', 500)
             
             actual_max_new_tokens = min(max_new_tokens, available_tokens)
             
             if actual_max_new_tokens <= 0:
                 return "Недостаточно места для генерации"
             
-            with torch.no_grad():
-                # 🔥 ОСНОВНЫЕ ПАРАМЕТРЫ ГЕНЕРАЦИИ
-                generation_params = {
-                    'input_ids': inputs['input_ids'],
-                    'max_new_tokens': actual_max_new_tokens,
-                    'pad_token_id': self.tokenizer.pad_token_id,
-                }
-                
-                # Добавляем attention_mask если есть
-                if 'attention_mask' in inputs:
-                    generation_params['attention_mask'] = inputs['attention_mask']
-                
-                # 🔥 ПЕРЕОПРЕДЕЛЯЕМ ПАРАМЕТРЫ ИЗ generation_config
-                # (если не переданы в kwargs)
-                if hasattr(self.model, 'generation_config'):
-                    config_params = self.model.generation_config.to_dict()
-                    # Берём только основные параметры, которые можно переопределить
-                    for key in ['do_sample', 'temperature', 'top_k', 'top_p', 
-                              'repetition_penalty', 'length_penalty', 'no_repeat_ngram_size']:
-                        if key in config_params and key not in kwargs:
-                            generation_params[key] = config_params[key]
-                
-                # 🔥 ОБНОВЛЯЕМ ПЕРЕДАННЫМИ ПАРАМЕТРАМИ (kwargs имеют приоритет)
-                generation_params.update(kwargs)
-                
-                # Логирование параметров
-                self.logger.debug(f"🧠 Параметры генерации: {list(generation_params.keys())}")
-                
-                # Генерация
-                outputs = self.model.generate(**generation_params)
-                
-                # 🔥 БЕЗОПАСНОЕ ДЕКОДИРОВАНИЕ
-                if hasattr(outputs, 'sequences'):
-                    # Если outputs - GenerationOutput
-                    generated_ids = outputs.sequences[0]
-                elif isinstance(outputs, torch.Tensor):
-                    # Если outputs - тензор
-                    generated_ids = outputs[0]
-                else:
-                    # Любой другой случай
-                    generated_ids = outputs[0]
-                
-                # Обрезаем промпт
-                generated_ids = generated_ids[input_length:]
-                
-                # Декодируем
-                generated_text = self.tokenizer.decode(
-                    generated_ids, 
-                    skip_special_tokens=True
-                ).strip()
-                
-                # 🔥 ПРОВЕРКА КАЧЕСТВА ГЕНЕРАЦИИ
-                if not generated_text or len(generated_text) < 2:
-                    self.logger.warning(f"⚠️ Слишком короткая генерация")
-                    # Пробуем batch_decode как fallback
-                    if isinstance(outputs, (list, torch.Tensor)):
-                        decoded = self.tokenizer.batch_decode(
-                            outputs, 
-                            skip_special_tokens=True
-                        )
-                        if decoded:
-                            full_text = decoded[0]
-                            generated_text = full_text[len(prompt):].strip()
-                
-                return generated_text
-                
-        except Exception as e:
-            self.logger.error(f"❌ Ошибка генерации: {e}")
-            import traceback
-            self.logger.error(traceback.format_exc())
-            return f"Ошибка генерации: {str(e)[:100]}"
-
-    def generate_with_curiosity(self, prompt: str, max_new_tokens: int = None, **kwargs) -> str:
-        """Генерация с активацией Curiosity системы"""
-        if not self.model or not self.tokenizer:
-            return "Модель не загружена"
-        
-        try:
-            self.model.eval()
-            
-            # Токенизация
-            inputs = self.tokenizer(prompt, return_tensors='pt').to(self.device)
-            
-            # 🔥 АКТИВИРУЕМ CURIOSITY ДЛЯ ЭТОЙ ГЕНЕРАЦИИ
+            # 🔥 АКТИВИРУЕМ CURIOSITY (если есть)
             curiosity_state = None
             if hasattr(self.model, 'adaptive_memory') and hasattr(self.model.adaptive_memory, 'curiosity'):
                 curiosity_state = self.model.adaptive_memory.curiosity.state
-                self.logger.info(f"🧠 Curiosity до генерации: {curiosity_state}")
+                self.logger.debug(f"🧠 Curiosity до генерации: {curiosity_state}")
+            
+            # 🔥 ПАРАМЕТРЫ ГЕНЕРАЦИИ
+            generation_params = {
+                'input_ids': inputs['input_ids'],
+                'max_new_tokens': actual_max_new_tokens,
+                'pad_token_id': self.tokenizer.pad_token_id,
+                'do_sample': True,
+                'temperature': kwargs.get('temperature', self.config.temperature),
+                'top_p': kwargs.get('top_p', self.config.top_p),
+                'top_k': kwargs.get('top_k', self.config.top_k),
+                'repetition_penalty': kwargs.get('repetition_penalty', self.config.repetition_penalty),
+            }
+            
+            if 'attention_mask' in inputs:
+                generation_params['attention_mask'] = inputs['attention_mask']
+            
+            # Переопределяем из kwargs
+            generation_params.update(kwargs)
             
             with torch.no_grad():
-                # Генерация
-                outputs = self.model.generate(
-                    input_ids=inputs['input_ids'],
-                    max_new_tokens=max_new_tokens or getattr(self.model.generation_config, 'max_new_tokens', 100),
-                    # Используем параметры из generation_config
-                    **{k: v for k, v in kwargs.items() if k not in ['input_ids', 'max_new_tokens']}
-                )
-                
-                # Декодируем
-                if hasattr(outputs, 'sequences'):
-                    generated_ids = outputs.sequences[0]
-                else:
-                    generated_ids = outputs[0]
-                
-                generated_text = self.tokenizer.decode(
-                    generated_ids[len(inputs['input_ids'][0]):], 
-                    skip_special_tokens=True
-                ).strip()
-                
-                # 🔥 ЛОГИРУЕМ CURIOSITY ПОСЛЕ ГЕНЕРАЦИИ
-                if curiosity_state is not None and hasattr(self.model.adaptive_memory, 'curiosity'):
-                    new_state = self.model.adaptive_memory.curiosity.state
-                    if new_state != curiosity_state:
-                        self.logger.info(f"🧠 Curiosity изменилось: {curiosity_state} → {new_state}")
-                
-                return generated_text
-                
-        except Exception as e:
-            self.logger.error(f"❌ Ошибка генерации с curiosity: {e}")
-            return f"Ошибка: {str(e)[:50]}"
+                outputs = self.model.generate(**generation_params)
             
-    def _extract_generated_text(self, original_prompt: str, full_text: str) -> str:
-        """
-        Improved text extraction with multiple fallback methods
-        """
-        if not full_text:
-            return ""
-        
-        # Метод 1: Прямое сравнение
-        if full_text.startswith(original_prompt):
-            return full_text[len(original_prompt):].strip()
-        
-        # Метод 2: Нормализованное сравнение
-        normalized_prompt = ' '.join(original_prompt.split())
-        normalized_full = ' '.join(full_text.split())
-        
-        if normalized_full.startswith(normalized_prompt):
-            # Находим позицию в оригинальной строке
-            prompt_words = original_prompt.split()
-            full_words = full_text.split()
+            # Декодирование
+            if hasattr(outputs, 'sequences'):
+                generated_ids = outputs.sequences[0]
+            else:
+                generated_ids = outputs[0]
             
-            if len(full_words) > len(prompt_words):
-                # Возвращаем слова после промпта
-                return ' '.join(full_words[len(prompt_words):])
-        
-        # Метод 3: Если ничего не сработало, возвращаем всё
-        # (может быть токенизатор добавил специальные токены)
-        return full_text.strip()
- 
-    def _generate_with_adjusted_params(self, prompt: str, max_length: int) -> str:
-        """
-        Generation with slightly adjusted parameters
-        """
-        try:
-            inputs = self.tokenizer(prompt, return_tensors='pt').to(self.device)
-            input_length = inputs['input_ids'].shape[1]
-            # Более креативные настройки, но не агрессивные
-            adjusted_params = {
-                'temperature': min(self.config.temperature + 0.2, 1.5),
-                'top_p': min(self.config.top_p + 0.1, 0.99),
-                'repetition_penalty': max(self.config.repetition_penalty - 0.1, 1.0),
-                'do_sample': True,
-                'num_beams': 3, # Добавляем beam search для разнообразия
-            }
-            outputs = self.model.generate(
-                **inputs,
-                max_length=max_length,
-                **adjusted_params
-            )
-            full_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            return self._extract_generated_text(prompt, full_text)
+            generated_text = self.tokenizer.decode(
+                generated_ids[input_length:], 
+                skip_special_tokens=True
+            ).strip()
+            
+            # Логируем изменение curiosity
+            if curiosity_state is not None and hasattr(self.model.adaptive_memory, 'curiosity'):
+                new_state = self.model.adaptive_memory.curiosity.state
+                if new_state != curiosity_state:
+                    self.logger.debug(f"🧠 Curiosity: {curiosity_state} → {new_state}")
+            
+            return generated_text
+            
         except Exception as e:
-            self.logger.error(f"Ошибка в adjusted генерации: {e}")
-            return "Не удалось сгенерировать текст"
+            self.logger.error(f"❌ Ошибка генерации: {e}")
+            return f"Ошибка: {str(e)[:100]}"
+        
+        finally:
+            if was_training:
+                self.model.train()     
             
     def test_generation_parameters(self, prompt: str = "The future of AI"):
         """Test generation with different parameters"""
@@ -4636,7 +4532,7 @@ class ModelTrainer:
                     prompt,
                     temperature=params["temperature"],
                     top_p=params["top_p"],
-                    max_length=100
+                    max_length=300
                 )
                 self.console.print(f"\n🎯 {params['name']} (temp: {params['temperature']}, top_p: {params['top_p']}):")
                 self.console.print(Panel(result, style="green"))
@@ -4687,7 +4583,7 @@ class ModelTrainer:
         
         for prompt in self._test_prompts:
             try:
-                generated = self.generate_text(prompt, max_new_tokens=50)
+                generated = self.generate_text(prompt, max_new_tokens=300)
                 
                 # Простые метрики качества
                 words = generated.split()
@@ -5170,20 +5066,29 @@ class InteractiveInterface:
             user_input = input("\nВы: ").strip()
             if user_input.lower() == 'exit':
                 if self._confirm_action("Сохранить историю перед выходом?"):
+                    try:
+                        with open(self.chat_history_file, 'w', encoding='utf-8') as f:
+                            json.dump(self.chat_history, f, ensure_ascii=False, indent=2)
+                        self.console.print("[green]История сохранена![/green]")
+                    except Exception as e:
+                        self.logger.error(f"Не удалось сохранить историю: {e}")
+                break
+            if user_input.lower() == 'save':
+                try:
                     with open(self.chat_history_file, 'w', encoding='utf-8') as f:
                         json.dump(self.chat_history, f, ensure_ascii=False, indent=2)
                     self.console.print("[green]История сохранена![/green]")
-                break
-            if user_input.lower() == 'save':
-                with open(self.chat_history_file, 'w', encoding='utf-8') as f:
-                    json.dump(self.chat_history, f, ensure_ascii=False, indent=2)
-                self.console.print("[green]История сохранена![/green]")
+                except Exception as e:
+                    self.logger.error(f"Не удалось сохранить историю: {e}")
                 continue
             if user_input.lower() == 'load':
                 if os.path.exists(self.chat_history_file):
-                    with open(self.chat_history_file, 'r', encoding='utf-8') as f:
-                        self.chat_history = json.load(f)
-                    self.console.print("[yellow]История загружена![/yellow]")
+                    try:
+                        with open(self.chat_history_file, 'r', encoding='utf-8') as f:
+                            self.chat_history = json.load(f)
+                        self.console.print("[yellow]История загружена![/yellow]")
+                    except Exception as e:
+                        self.logger.error(f"Не удалось загрузить историю: {e}")
                 else:
                     self.console.print("[red]Файл истории не найден![/red]")
                 continue
@@ -5847,6 +5752,7 @@ class InteractiveInterface:
                 "name": "🛡️ Безопасный старт",
                 "desc": "База медленно, личность средне, память быстро",
                 "values": {
+                    "embeddings": 0.05,          # ← добавить
                     "transformer_base": 0.1,
                     "personality_core": 0.3,
                     "living_layer": 0.5,
@@ -5860,6 +5766,7 @@ class InteractiveInterface:
                 "name": "🚀 Быстрая настройка памяти",
                 "desc": "Акцент на Mamba Heads и обмен опытом",
                 "values": {
+                    "embeddings": 0.03,          # ← добавить
                     "transformer_base": 0.05,
                     "personality_core": 0.2,
                     "living_layer": 0.8,
@@ -5873,6 +5780,7 @@ class InteractiveInterface:
                 "name": "🎯 Сбалансированный (РЕКОМЕНДУЕМЫЙ)",
                 "desc": "Оптимальный баланс всех компонентов",
                 "values": {
+                    "embeddings": 0.04,          # ← добавить
                     "transformer_base": 0.15,
                     "personality_core": 0.4,
                     "living_layer": 0.7,
@@ -5886,6 +5794,7 @@ class InteractiveInterface:
                 "name": "🧠 Развитие личности",
                 "desc": "Акцент на Personality Core и эмоции",
                 "values": {
+                    "embeddings": 0.05,          # ← добавить
                     "transformer_base": 0.1,
                     "personality_core": 0.8,
                     "living_layer": 0.6,
@@ -5899,6 +5808,7 @@ class InteractiveInterface:
                 "name": "⚡ Только Mamba (ultra-safe)",
                 "desc": "Все заморожено кроме памяти Mamba",
                 "values": {
+                    "embeddings": 0.01,          # ← добавить
                     "transformer_base": 0.01,
                     "personality_core": 0.01,
                     "living_layer": 0.01,
@@ -5912,6 +5822,7 @@ class InteractiveInterface:
                 "name": "🤖 Интеллектуальный фокус",
                 "desc": "База средне, память быстро, обмен опытом быстро",
                 "values": {
+                    "embeddings": 0.03,          # ← добавить
                     "transformer_base": 0.2,
                     "personality_core": 0.3,
                     "living_layer": 0.9,
@@ -5925,6 +5836,7 @@ class InteractiveInterface:
                 "name": "💫 Полная активация",
                 "desc": "Все компоненты активно обучаются",
                 "values": {
+                    "embeddings": 0.02,          # ← добавить
                     "transformer_base": 0.25,
                     "personality_core": 0.6,
                     "living_layer": 1.0,
