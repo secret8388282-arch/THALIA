@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# bidirectional_exchange.py - ИСПРАВЛЕННАЯ ВЕРСИЯ v3.8
+# bidirectional_exchange.py - ИСПРАВЛЕННАЯ ВЕРСИЯ v3.9
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 # ===================================================================
 class BidirectionalExperienceExchange(nn.Module):
     """
-    🔄 ИСПРАВЛЕННЫЙ v3.8: ДВУСТОРОННИЙ обмен опытом между Transformer и Mamba
+    🔄 ИСПРАВЛЕННЫЙ v3.9: ДВУСТОРОННИЙ обмен опытом между Transformer и Mamba
     (Только pair-буферы, обратная совместимость со старыми чекпоинтами)
     """   
     def __init__(self, config):
@@ -148,7 +148,12 @@ class BidirectionalExperienceExchange(nn.Module):
         # 🔥 ДЛЯ ОТСЛЕЖИВАНИЯ ALIGNMENT LOSS
         self._last_align_loss = 0.0
         
-        logger.info(f"🔄 ДВУСТОРОННИЙ ОБМЕН v3.8: Только pair-буферы, обратная совместимость")
+        # Счетчики для мониторинга заполнения буфера
+        self._logged_50_percent = False
+        self._logged_75_percent = False
+        self._logged_90_percent = False
+        
+        logger.info(f"🔄 ДВУСТОРОННИЙ ОБМЕН v3.9: Только pair-буферы, max_size={self.max_experience_bank_size}")
 
     def _init_buffers(self):
         """Инициализация только pair-буферов"""
@@ -208,9 +213,47 @@ class BidirectionalExperienceExchange(nn.Module):
                 m_raw = m_raw[:min_batch]
                 batch_size = min_batch
             
+            # 🔥 ИСПРАВЛЕНИЕ: Явная синхронизация устройств
+            buffer_device = self.pair_t_buffer.device
+            t_raw = t_raw.to(buffer_device)
+            m_raw = m_raw.to(buffer_device)
+            
             # Защита от NaN
             t_raw = torch.nan_to_num(t_raw, nan=0.0, posinf=1.0, neginf=-1.0)
             m_raw = torch.nan_to_num(m_raw, nan=0.0, posinf=1.0, neginf=-1.0)
+            
+            # ===========================================================
+            # 🔥 КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Защита от коллизий индексов
+            # ===========================================================
+            if batch_size >= self.max_experience_bank_size:
+                logger.warning(
+                    f"⚠️ batch_size ({batch_size}) >= max_experience_bank_size ({self.max_experience_bank_size}). "
+                    f"Буфер будет перезаписан полностью, беру последние {self.max_experience_bank_size} элементов."
+                )
+                # Берем последние max_size элементов из батча
+                t_raw = t_raw[-self.max_experience_bank_size:]
+                m_raw = m_raw[-self.max_experience_bank_size:]
+                batch_size = self.max_experience_bank_size
+                
+                # Прямая запись с нуля (перезаписываем весь буфер)
+                self.pair_t_buffer.data.copy_(t_raw)
+                self.pair_m_buffer.data.copy_(m_raw)
+                self.pair_count.fill_(batch_size)
+                self.pair_ptr.fill_(batch_size % self.max_experience_bank_size)
+                
+                # Логируем заполнение буфера
+                fill_ratio = batch_size / self.max_experience_bank_size
+                if fill_ratio >= 0.9 and not self._logged_90_percent:
+                    logger.info(f"📊 Pair буфер заполнен на {fill_ratio:.1%} ({batch_size}/{self.max_experience_bank_size})")
+                    self._logged_90_percent = True
+                elif fill_ratio >= 0.75 and not self._logged_75_percent:
+                    logger.info(f"📊 Pair буфер заполнен на {fill_ratio:.1%} ({batch_size}/{self.max_experience_bank_size})")
+                    self._logged_75_percent = True
+                elif fill_ratio >= 0.5 and not self._logged_50_percent:
+                    logger.info(f"📊 Pair буфер заполнен на {fill_ratio:.1%} ({batch_size}/{self.max_experience_bank_size})")
+                    self._logged_50_percent = True
+                
+                return
             
             # ===========================================================
             # 🔥 Векторизованная вставка (без цикла с item/fill)
@@ -235,9 +278,17 @@ class BidirectionalExperienceExchange(nn.Module):
             new_count = min(self.max_experience_bank_size, self.pair_count.item() + batch_size)
             self.pair_count.fill_(new_count)
             
-            # Опционально: логируем при переполнении буфера
-            if self.pair_count.item() == self.max_experience_bank_size and self.pair_count.item() - batch_size < self.max_experience_bank_size:
-                logger.debug(f"🔄 Experience buffer заполнен: {self.max_experience_bank_size} пар")
+            # Логируем при заполнении буфера
+            fill_ratio = new_count / self.max_experience_bank_size
+            if fill_ratio >= 0.9 and not self._logged_90_percent:
+                logger.info(f"📊 Pair буфер заполнен на {fill_ratio:.1%} ({new_count}/{self.max_experience_bank_size})")
+                self._logged_90_percent = True
+            elif fill_ratio >= 0.75 and not self._logged_75_percent:
+                logger.info(f"📊 Pair буфер заполнен на {fill_ratio:.1%} ({new_count}/{self.max_experience_bank_size})")
+                self._logged_75_percent = True
+            elif fill_ratio >= 0.5 and not self._logged_50_percent:
+                logger.info(f"📊 Pair буфер заполнен на {fill_ratio:.1%} ({new_count}/{self.max_experience_bank_size})")
+                self._logged_50_percent = True
 
     # ===========================================================
     # 🔥 ALIGNMENT LOSS НА ОСНОВЕ СИНХРОНИЗИРОВАННЫХ ПАР
@@ -249,9 +300,10 @@ class BidirectionalExperienceExchange(nn.Module):
         """
         count = self.pair_count.item()
         if count < 32:
-            return torch.tensor(0.0, device=self.alignment_score.device, requires_grad=True)
+            return torch.tensor(0.0, device=self.pair_t_buffer.device, requires_grad=True)
         
-        device = self.alignment_score.device
+        # 🔥 ИСПРАВЛЕНИЕ: используем устройство из буфера, а не из alignment_score
+        device = self.pair_t_buffer.device
         n = min(64, count)
         ptr = self.pair_ptr.item()
         
@@ -278,6 +330,11 @@ class BidirectionalExperienceExchange(nn.Module):
         # Добавляем небольшую регуляризацию для разнообразия
         diversity_loss = -torch.std(t_shared) * 0.001 - torch.std(m_shared) * 0.001
         loss = alignment_loss + diversity_loss
+        
+        # 🔥 Проверка на валидность лосса
+        if not torch.isfinite(loss):
+            logger.warning(f"⚠ Alignment loss невалиден: {loss.item()}, возвращаю 0")
+            return torch.tensor(0.0, device=device, requires_grad=True)
         
         # Обновляем alignment score (чем меньше loss, тем лучше)
         with torch.no_grad():
@@ -317,17 +374,40 @@ class BidirectionalExperienceExchange(nn.Module):
         
         # Коррекция размерностей Mamba
         if mamba_hidden is not None:
+            # 🔥 ИСПРАВЛЕНИЕ: проверка совместимости форм перед expand
             if mamba_hidden.shape[0] != transformer_hidden.shape[0]:
                 batch_size = transformer_hidden.shape[0]
-                mamba_hidden = mamba_hidden.expand(batch_size, -1, -1)
+                try:
+                    mamba_hidden = mamba_hidden.expand(batch_size, -1, -1)
+                except RuntimeError as e:
+                    logger.warning(f"⚠ Не удалось expand mamba_hidden: {e}, использую повторение")
+                    # Fallback: повторяем первый элемент
+                    if mamba_hidden.shape[0] == 1:
+                        mamba_hidden = mamba_hidden.repeat(batch_size, 1, 1)
+                    else:
+                        # Обрезаем или дополняем
+                        if mamba_hidden.shape[0] > batch_size:
+                            mamba_hidden = mamba_hidden[:batch_size]
+                        else:
+                            # Дополняем нулями
+                            pad = torch.zeros(batch_size - mamba_hidden.shape[0], 
+                                            mamba_hidden.shape[1], 
+                                            mamba_hidden.shape[2],
+                                            device=mamba_hidden.device)
+                            mamba_hidden = torch.cat([mamba_hidden, pad], dim=0)
             
             if mamba_hidden.shape[1] == 1 and transformer_hidden.shape[1] > 1:
                 seq_len = transformer_hidden.shape[1]
-                mamba_hidden = mamba_hidden.expand(-1, seq_len, -1)
+                try:
+                    mamba_hidden = mamba_hidden.expand(-1, seq_len, -1)
+                except RuntimeError as e:
+                    logger.warning(f"⚠ Не удалось expand mamba_hidden по seq: {e}")
+                    # Fallback: повторяем
+                    mamba_hidden = mamba_hidden.repeat(1, seq_len, 1)
         
         self.exchange_counter += 1
         
-        # Определяем устройство
+        # Определяем устройство из входных данных
         device = transformer_hidden.device
         
         try:
@@ -434,6 +514,10 @@ class BidirectionalExperienceExchange(nn.Module):
         for name, param in self.named_parameters():
             if param.requires_grad and param.grad is not None:
                 grad_norm = param.grad.norm().item()
+                # 🔥 Проверка на валидность градиента
+                if not math.isfinite(grad_norm):
+                    logger.warning(f"⚠ Невалидный градиент для {name}: {grad_norm}")
+                    continue
                 total_grad_norm += grad_norm
                 param_count += 1
                 
@@ -490,7 +574,8 @@ class BidirectionalExperienceExchange(nn.Module):
         if self.pair_count.item() < 5:
             return {'quality': 0.0, 'samples': 0}
         
-        device = self.alignment_score.device
+        # 🔥 ИСПРАВЛЕНИЕ: используем устройство из буфера
+        device = self.pair_t_buffer.device
         
         try:
             count = self.pair_count.item()
@@ -536,6 +621,12 @@ class BidirectionalExperienceExchange(nn.Module):
             pair_real = (self.pair_t_buffer.abs().sum(dim=-1) > 1e-6).sum().item()
             pair_count = self.pair_count.item()
             
+            # 🔥 Дополнительная проверка: count не должен превышать max
+            if pair_count > self.max_experience_bank_size:
+                logger.error(f"❌ pair_count ({pair_count}) > max_experience_bank_size ({self.max_experience_bank_size})! Исправляю...")
+                self.pair_count.fill_(self.max_experience_bank_size)
+                pair_count = self.max_experience_bank_size
+            
             if pair_real != pair_count:
                 logger.warning(f"⚠️ Расхождение в pair буфере: счетчик={pair_count}, реально={pair_real}")
                 self.pair_count.fill_(pair_real)
@@ -572,6 +663,11 @@ class BidirectionalExperienceExchange(nn.Module):
         
         loss = self.compute_direct_alignment_loss()
         
+        # 🔥 Проверка на валидность
+        if not torch.isfinite(loss):
+            print("❌ Loss невалиден (NaN/Inf)")
+            return False
+        
         if loss.item() > 0:
             print(f"✅ Alignment loss требует градиентов: {loss.requires_grad}")
             print(f"✅ Значение loss: {loss.item():.6f}")
@@ -580,12 +676,20 @@ class BidirectionalExperienceExchange(nn.Module):
             m_proj = self.mamba_to_shared[0].weight
             
             if t_proj.grad is not None:
-                print(f"✅ Transformer projector уже имеет градиенты")
+                grad_norm = t_proj.grad.norm().item()
+                if math.isfinite(grad_norm):
+                    print(f"✅ Transformer projector уже имеет градиенты (norm={grad_norm:.6f})")
+                else:
+                    print(f"⚠️ Transformer projector имеет невалидные градиенты")
             else:
                 print("ℹ️ Transformer projector пока без градиентов (нужен backward)")
             
             if m_proj.grad is not None:
-                print(f"✅ Mamba projector уже имеет градиенты")
+                grad_norm = m_proj.grad.norm().item()
+                if math.isfinite(grad_norm):
+                    print(f"✅ Mamba projector уже имеет градиенты (norm={grad_norm:.6f})")
+                else:
+                    print(f"⚠️ Mamba projector имеет невалидные градиенты")
             else:
                 print("ℹ️ Mamba projector пока без градиентов (нужен backward)")
             
@@ -593,7 +697,7 @@ class BidirectionalExperienceExchange(nn.Module):
             print("⚠️ Alignment loss = 0, буферы пусты")
         
         print("=" * 60)
-        return loss.item() > 0
+        return loss.item() > 0 and torch.isfinite(loss)
     
     # ===========================================================
     # 🔥 ОБРАТНАЯ СОВМЕСТИМОСТЬ ДЛЯ СТАРЫХ ЧЕКПОИНТОВ
@@ -692,5 +796,16 @@ class BidirectionalExperienceExchange(nn.Module):
         if 'exchange_counter' in state:
             self.exchange_counter = state['exchange_counter']
         
+        # 🔥 Дополнительная проверка: count не должен превышать max
+        if self.pair_count.item() > self.max_experience_bank_size:
+            logger.warning(f"⚠️ pair_count ({self.pair_count.item()}) > max, исправляю...")
+            self.pair_count.fill_(self.max_experience_bank_size)
+        
         self.invalidate_cache()
+        
+        # Сбрасываем флаги логирования заполнения
+        self._logged_50_percent = False
+        self._logged_75_percent = False
+        self._logged_90_percent = False
+        
         logger.info(f"✅ Состояние обмена опытом восстановлено, пар в буфере: {self.pair_count.item()}")
