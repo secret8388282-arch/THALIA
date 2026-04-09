@@ -611,65 +611,44 @@ class ThaliaMambaHead(nn.Module):
             
     def _process_chunk_mimo_vectorized(self, x_chunk, dt_chunk, B_chunk, C_chunk, A, current_hidden):
         """
-        🔥 ПОЛНОСТЬЮ ВЕКТОРИЗОВАННАЯ версия без Python цикла.
-        Использует параллельное сканирование через cumprod/cumsum.
+        🔥 ИСПРАВЛЕННАЯ БЕЗОПАСНАЯ ВЕРСИЯ: RNN цикл вместо cumprod.
+        Устраняет взрыв градиентов (NaNs) при backward pass!
         """
         batch_size, chunk_len, inner_dim = x_chunk.shape
         state_dim = A.shape[-1]
        
-        # A: [inner_dim, state_dim] → расширяем до [batch, inner_dim, state_dim]
-        A_expanded = A.unsqueeze(0).expand(batch_size, -1, -1)
+        h = current_hidden  # [batch, inner_dim, state_dim]
+        ys = []
        
-        # Вычисляем dA = exp(dt * A) для всего чанка сразу
-        # dt_chunk: [batch, chunk_len, inner_dim]
-        dt_expanded = dt_chunk.unsqueeze(-1) # [batch, chunk_len, inner_dim, 1]
-        A_expanded = A_expanded.unsqueeze(1) # [batch, 1, inner_dim, state_dim]
-        dA = torch.exp(dt_expanded * A_expanded) # [batch, chunk_len, inner_dim, state_dim]
+        for t in range(chunk_len):
+            # Извлекаем данные для текущего шага
+            dt_t = dt_chunk[:, t, :].unsqueeze(-1)  # [batch, inner_dim, 1]
+            A_t = A.unsqueeze(0)                    # [1, inner_dim, state_dim]
+            
+            # Коэффициенты перехода
+            dA_t = torch.exp(dt_t * A_t)            # [batch, inner_dim, state_dim]
+           
+            B_t = B_chunk[:, t, :].unsqueeze(1)     # [batch, 1, state_dim]
+            x_t = x_chunk[:, t, :].unsqueeze(-1)    # [batch, inner_dim, 1]
+            dB_t = dt_t * B_t * x_t                 # [batch, inner_dim, state_dim]
+           
+            # Обновляем скрытое состояние
+            h = dA_t * h + dB_t
+           
+            # Вычисляем выход
+            C_t = C_chunk[:, t, :].unsqueeze(1)     # [batch, 1, state_dim]
+            y_t = (h * C_t).sum(dim=-1)             # [batch, inner_dim]
+            ys.append(y_t)
+           
+        y = torch.stack(ys, dim=1)  # [batch, chunk_len, inner_dim]
        
-        # dB = dt * B * x
-        # B_chunk: [batch, chunk_len, state_dim]
-        # x_chunk: [batch, chunk_len, inner_dim]
-        B_expanded = B_chunk.unsqueeze(2) # [batch, chunk_len, 1, state_dim]
-        x_expanded = x_chunk.unsqueeze(-1) # [batch, chunk_len, inner_dim, 1]
-        dB = dt_expanded * B_expanded * x_expanded # [batch, chunk_len, inner_dim, state_dim]
-       
-        # Параллельное сканирование для рекурренции h_t = dA_t * h_{t-1} + dB_t
-        # Используем ассоциативный скан через cumprod и взвешенную сумму
-       
-        # Кумулятивные произведения dA (сдвинутые)
-        dA_cumprod = torch.cumprod(dA, dim=1) # [batch, chunk_len, inner_dim, state_dim]
-       
-        # Сдвигаем для правильной индексации
-        dA_cumprod_shifted = torch.cat([
-            torch.ones_like(dA_cumprod[:, :1]),
-            dA_cumprod[:, :-1]
-        ], dim=1) # [batch, chunk_len, inner_dim, state_dim]
-       
-        # Взвешиваем dB
-        dB_scaled = dB / dA.clamp(min=1e-8) # [batch, chunk_len, inner_dim, state_dim]
-       
-        # Кумулятивная сумма
-        dB_cumsum = torch.cumsum(dB_scaled * dA_cumprod_shifted, dim=1) # [batch, chunk_len, inner_dim, state_dim]
-       
-        # Итоговые состояния (предполагая h_0 = 0)
-        h = dB_cumsum # [batch, chunk_len, inner_dim, state_dim]
-       
-        # Выход: y = h * C + D * x
-        # C_chunk: [batch, chunk_len, state_dim]
-        C_expanded = C_chunk.unsqueeze(2) # [batch, chunk_len, 1, state_dim]
-        y = (h * C_expanded).sum(dim=-1) # [batch, chunk_len, inner_dim]
-       
-        # Добавляем D * x
         if hasattr(self, 'D'):
             y = y + self.D.unsqueeze(0).unsqueeze(0) * x_chunk
-       
-        # Защита от NaN
+           
+        # Защита от NaN на выходе
         y = torch.nan_to_num(y, nan=0.0, posinf=1.0, neginf=-1.0)
-       
-        # Последнее состояние для следующего чанка
-        last_h = h[:, -1] # [batch, inner_dim, state_dim]
-       
-        return y, last_h
+        
+        return y, h
         
     def forward(self, x, hidden_state=None, training_mode=False, autoencoder_mode=False):
         original_input = x.clone()
@@ -3294,8 +3273,8 @@ class AdaptiveMemoryHeads(nn.Module):
 
             
     def _perform_contrastive_sleep_on_copies(self, positive_thoughts, hard_negative_thoughts,
-                                                 gaslight_thoughts, writer_copy, reader_copy,
-                                                 optimizer, device):
+                                                     gaslight_thoughts, writer_copy, reader_copy,
+                                                     optimizer, device):
         """🔥 Контрастный сон на ПОЛНЫХ КОПИЯХ моделей"""
        
         logger.info(f"💤 Контрастный сон на копиях: {len(positive_thoughts)} 👍, "
@@ -3478,9 +3457,25 @@ class AdaptiveMemoryHeads(nn.Module):
                             training_stats['avg_recon_loss'] * epoch + autoencoder_loss.item()
                         ) / (epoch + 1)
                    
-                    # Backward pass - теперь точно есть граф!
+                    # ===========================================================
+                    # 🔥 Backward pass - теперь точно есть граф!
+                    # ===========================================================
                     total_loss.backward()
                    
+                    # ===========================================================
+                    # 🔥 АНТИ-NaN ЩИТ ДЛЯ ОПТИМИЗАТОРА
+                    # ===========================================================
+                    has_nan_grad = False
+                    for param in list(writer_copy.parameters()) + list(reader_copy.parameters()):
+                        if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                            has_nan_grad = True
+                            break
+                            
+                    if has_nan_grad:
+                        logger.warning(f"⚠ Сон Ep {epoch}: Найдены NaN в градиентах! Пропуск шага оптимизатора.")
+                        optimizer.zero_grad()
+                        continue
+
                     torch.nn.utils.clip_grad_norm_(writer_copy.parameters(), max_norm=0.5)
                     torch.nn.utils.clip_grad_norm_(reader_copy.parameters(), max_norm=0.5)
                    
@@ -5549,7 +5544,7 @@ class MotivationModule(nn.Module):
             
         quality_score = self.evaluator(x).squeeze(-1)          # [batch]
         
-        # 🔥 ИСПРАВЛЕНИЕ: нормализация весов
+        # 🔥 ИСПРАВЛЕНИЕ: Пуленепробиваемая нормализация весов
         # Softmax гарантирует, что веса положительные и в сумме дают 1.0
         weights = torch.softmax(torch.stack([
             self.novelty_weight, 
