@@ -1722,7 +1722,7 @@ class TemporalHebbLayer(nn.Module):
             "dominant_share_ema": 0.0,
         }
         
-# ===================================================================        
+# ===================================================================              
 # НЕЙРОКОНТРОЛЛЕР v9.8
 # ===================================================================
 class ImprovedPsycheController(nn.Module):
@@ -2731,11 +2731,6 @@ class DynamicPsycheCoreV6(nn.Module):
         # ===========================================================
         # 🔥 ЗАЩИТА ОСТАЛЬНЫХ ПАРАМЕТРОВ (кроме opposition_weights)
         # ===========================================================
-        for name, param in self.named_parameters():
-            if 'opposition_weights' in name:
-                continue
-            param.register_hook(lambda grad: torch.clamp(grad, -5.0, 5.0))
-        logger.info("🛡️ Защита параметров психики: clip ±5.0")
         
         max_seq_len = getattr(config, "n_positions", 2048)
         decay = torch.linspace(1.0, 0.4, max_seq_len)
@@ -2758,6 +2753,9 @@ class DynamicPsycheCoreV6(nn.Module):
         # Регистрация буферов для repulsion loss
         self.register_buffer('_repulsion_loss_buffer', torch.tensor(0.0))
         self._current_repulsion_loss = None
+ 
+        # === ФЛАГ ДЛЯ УПРАВЛЕНИЯ PPO ===
+        self.ppo_enabled = getattr(config, 'ppo_enabled', True)  # можно отключать при заморозке 
  
         logger.info(f"🧠 Динамичная психика v9.0 с полным PPO: {self.num_traits} черт, {self.num_drives} драйвов")
     
@@ -2857,28 +2855,29 @@ class DynamicPsycheCoreV6(nn.Module):
     #  update_controller
     # ===================================================================
     def update_controller(self, reward: float, done: bool = False):
-        """Добавляем в буфер с raw action - ИСПРАВЛЕНО"""
+        """Обновление контроллера с проверкой обучаемости"""
         if isinstance(reward, torch.Tensor):
             reward = reward.item()
         
         if abs(reward) < 0.001 or not self.training:
             return
         
-        # 🔥 Убеждаемся, что оптимизатор создан - ИСПРАВЛЕНО!
+        # 🔥 ПРОВЕРКА: есть ли обучаемые параметры в контроллере
+        has_trainable_params = any(p.requires_grad for p in self.controller.parameters())
+        if not has_trainable_params:
+            return
+        
         device = next(self.controller.parameters()).device
         self._ensure_optimizers(device)  
         
-        # Получаем текущее состояние
         current_state = torch.cat([
             self.get_trait_values().to(device), 
             self.get_drive_values().to(device), 
             self.mood.mood_state.to(device).view(1)
         ]).to(device)
         
-        # Сохраняем для следующего шага
         self._prev_controller_state.data.copy_(current_state.detach().clone())
         
-        # ✅ Убеждаемся, что все на правильном устройстве перед клонированием
         state = self._prev_controller_state.to(device).clone()
         action_raw = self.controller.last_action_raw.to(device).clone()
         old_log_prob = self.controller.last_log_prob.to(device).clone()
@@ -2897,7 +2896,6 @@ class DynamicPsycheCoreV6(nn.Module):
                 next_state = torch.zeros_like(state)
                 next_value = torch.tensor(0.0, device=device)
         
-        # Добавляем в буфер
         self.controller.add_to_batch_buffer(
             state=state,
             action_raw=action_raw,
@@ -2913,9 +2911,19 @@ class DynamicPsycheCoreV6(nn.Module):
     
     def _perform_ppo_update(self):
         """
-        🔥 PPO UPDATE - ИСПРАВЛЕННАЯ ВЕРСИЯ с правильной обработкой устройств
+        🔥 PPO UPDATE - ИСПРАВЛЕННАЯ ВЕРСИЯ с проверкой обучаемости параметров
         """
         device = next(self.controller.parameters()).device
+        
+        # 🔥 КРИТИЧЕСКАЯ ПРОВЕРКА: есть ли обучаемые параметры в контроллере?
+        has_trainable_params = any(p.requires_grad for p in self.controller.parameters())
+        
+        if not has_trainable_params:
+            # Все параметры контроллера заморожены — пропускаем PPO update
+            if self.total_ticks.item() % 100 == 0:
+                logger.debug("⏭️ PPO update пропущен: все параметры контроллера заморожены")
+            self.controller.clear_batch_buffer()
+            return
         
         # Убеждаемся, что оптимизатор существует
         if not self._optimizers_initialized:
@@ -2936,15 +2944,15 @@ class DynamicPsycheCoreV6(nn.Module):
         next_states = next_states.to(device)
         dones = dones.to(device)
         
-        # Обнуляем градиенты
-        self.controller_optimizer.zero_grad()
-        
+        # ===========================================================
+        # 🔥 ВЫЧИСЛЕНИЕ ADVANTAGES И TD TARGETS
+        # ===========================================================
         with torch.no_grad():
             current_values = self.controller.get_value(states).squeeze(-1)
             next_values = self.controller.get_value(next_states).squeeze(-1)
             
-            # ИСПРАВЛЕНИЕ: конвертируем dones во float
             td_targets = rewards + self.controller_gamma * next_values * (1.0 - dones.float())
+            td_targets = torch.clamp(td_targets, -10.0, 10.0)
             
             advantages = torch.zeros_like(td_targets)
             last_gae = 0.0
@@ -2957,47 +2965,67 @@ class DynamicPsycheCoreV6(nn.Module):
                 adv_mean = advantages.mean()
                 adv_std = advantages.std() + 1e-8
                 advantages = (advantages - adv_mean) / adv_std
+                advantages = torch.clamp(advantages, -5.0, 5.0)
         
-        current_values = self.controller.get_value(states).squeeze(-1)
-        value_loss = F.mse_loss(current_values, td_targets.detach())
+        advantages = advantages.detach()
+        td_targets = td_targets.detach()
         
-        # 🔥 ИСПРАВЛЕННОЕ вычисление log_prob с безопасностью
-        new_log_probs = self.controller.compute_log_prob_current(states, action_raws)
+        # ===========================================================
+        # 🔥 PPO K-EPOCHS
+        # ===========================================================
+        k_epochs = 3
         
-        # Защита от NaN в log_probs
-        new_log_probs = torch.nan_to_num(new_log_probs, nan=-10.0, posinf=10.0, neginf=-10.0)
-        old_log_probs = torch.nan_to_num(old_log_probs, nan=-10.0, posinf=10.0, neginf=-10.0)
+        for epoch in range(k_epochs):
+            self.controller_optimizer.zero_grad()
+            
+            # Вычисляем текущие value
+            current_values = self.controller.get_value(states).squeeze(-1)
+            value_loss = F.mse_loss(current_values, td_targets)
+            value_loss = torch.clamp(value_loss, 0.0, 100.0)
+            
+            # Вычисляем текущие log probabilities
+            new_log_probs = self.controller.compute_log_prob_current(states, action_raws)
+            new_log_probs = torch.nan_to_num(new_log_probs, nan=-10.0, posinf=10.0, neginf=-10.0)
+            old_log_probs_clamped = torch.clamp(old_log_probs, -20.0, 20.0)
+            
+            # Вычисляем ratio
+            log_ratio = new_log_probs - old_log_probs_clamped
+            log_ratio = torch.clamp(log_ratio, -5.0, 5.0)
+            ratio = torch.exp(log_ratio)
+            ratio = torch.clamp(ratio, 0.0, 20.0)
+            
+            # PPO clipped objective
+            surr1 = ratio * advantages
+            surr2 = torch.clamp(ratio, 1.0 - self.controller_clip_epsilon, 
+                                1.0 + self.controller_clip_epsilon) * advantages
+            policy_loss = -torch.min(surr1, surr2).mean()
+            
+            # Entropy bonus
+            current_dist = self.controller.get_current_distribution(states)
+            entropy = current_dist.entropy().mean()
+            entropy = torch.clamp(entropy, 0.0, 10.0)
+            
+            # Total loss
+            total_loss = policy_loss + 0.5 * value_loss - 0.01 * entropy
+            total_loss = torch.clamp(total_loss, -100.0, 100.0)
+            
+            # 🔥 КРИТИЧЕСКАЯ ПРОВЕРКА: есть ли градиентная связь?
+            if total_loss.requires_grad and has_trainable_params:
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.controller.parameters(), 1.0)
+                self.controller_optimizer.step()
+            else:
+                # Нет градиентной связи — пропускаем шаг
+                if epoch == 0 and self.total_ticks.item() % 100 == 0:
+                    logger.debug(f"⏭️ PPO step {epoch} пропущен: loss.requires_grad={total_loss.requires_grad}")
+                break
         
-        log_ratio = new_log_probs - old_log_probs
-        log_ratio = torch.clamp(log_ratio, -5.0, 5.0)  # Защита от экстремальных значений
-        ratio = torch.exp(log_ratio)
-        
-        surr1 = ratio * advantages
-        surr2 = torch.clamp(ratio, 1.0 - self.controller_clip_epsilon, 
-                            1.0 + self.controller_clip_epsilon) * advantages
-        policy_loss = -torch.min(surr1, surr2).mean()
-        
-        current_dist = self.controller.get_current_distribution(states)
-        entropy = current_dist.entropy().mean()
-        entropy = torch.clamp(entropy, 0.0, 10.0)  # Защита от взрыва энтропии
-        
-        total_loss = policy_loss + 0.5 * value_loss - 0.01 * entropy
-        
-        if torch.isnan(policy_loss).any() or torch.isnan(value_loss).any() or torch.isnan(total_loss).any():
-            logger.warning("⚠ NaN detected in PPO losses, skipping update")
-            self.controller.clear_batch_buffer()
-            return
-        
-        # Backward
-        total_loss.backward()
-        
-        # Clip gradients
-        torch.nn.utils.clip_grad_norm_(self.controller.parameters(), 1.0)
-        
-        # Step
-        self.controller_optimizer.step()
-        
+        # Очищаем буфер
         self.controller.clear_batch_buffer()
+        
+        # Обновляем baseline
+        with torch.no_grad():
+            self.controller_reward_baseline = 0.99 * self.controller_reward_baseline + 0.01 * rewards.mean()
         
     def get_controller_report(self) -> Dict:
         """Отчет о состоянии контроллера"""
@@ -3106,28 +3134,20 @@ class DynamicPsycheCoreV6(nn.Module):
             return max(-2.0, min(2.0, total_reward))
     
     def tick(self, training: bool = False):
-        """🧠 ДИНАМИЧНЫЙ тик v9.0 с единой логикой и repulsion loss"""
         self.total_ticks.add_(1)
         device = self.trait_raw.device
         exp_count = self.experiences_count.item()
         
-        # ИСПРАВЛЕНО: единая логика с градиентами/без через set_grad_enabled
         with torch.set_grad_enabled(training):
             self._core_tick_logic(device, exp_count)
         
-        # ===================================================================
         # 🔥 ИСПРАВЛЕНИЕ: Вычисление repulsion loss ПРИ ОБУЧЕНИИ
-        # Сохраняем с градиентами для Thalia, в буфер - только для статистики
-        # ===================================================================
         if training:
             try:
                 rep_loss = self.compute_repulsion_loss()
                 
                 if rep_loss is not None:
-                    # В буфер сохраняем ТОЛЬКО для логирования (detached)
                     self._repulsion_loss_buffer.data.copy_(rep_loss.detach())
-                    
-                    # 🔥 КЛЮЧЕВОЕ: Сохраняем rep_loss для get_repulsion_loss() С ГРАДИЕНТАМИ!
                     self._current_repulsion_loss = rep_loss
                     
                     if self.total_ticks.item() % 200 == 0:
@@ -3137,39 +3157,30 @@ class DynamicPsycheCoreV6(nn.Module):
                 logger.debug(f"⚠ Ошибка вычисления repulsion loss: {e}")
                 self._current_repulsion_loss = None
         
-        # ===================================================================
         # 🔥 ДИНАМИЧЕСКАЯ РЕГУЛИРОВКА СИЛЫ ВЛИЯНИЯ
-        # ===================================================================
         with torch.no_grad():
-            # Получаем метрики стабильности и энтропии из dynamics
             stability = getattr(self.dynamics, '_system_stability', torch.tensor(0.5)).item()
             entropy = getattr(self.dynamics, '_system_entropy', torch.tensor(0.5)).item()
             mood_abs = abs(self.mood.mood_state.item())
             
-            # Вычисляем целевую силу влияния
-            target = 0.25  # базовое значение
+            target = 0.25
             
-            # Корректировка по стабильности
             if stability < 0.3:
-                target -= 0.08  # Система нестабильна → уменьшаем влияние
+                target -= 0.08
             elif stability > 0.7:
-                target += 0.05  # Система стабильна → можно усилить влияние
+                target += 0.05
             
-            # Корректировка по энтропии
             if entropy > 0.7:
-                target -= 0.06  # Высокая энтропия → уменьшаем влияние
+                target -= 0.06
             elif entropy < 0.3:
-                target += 0.04  # Низкая энтропия → можно усилить влияние
+                target += 0.04
             
-            # Влияние настроения (немного)
             target += mood_abs * 0.03
             
-            # Проверяем наличие min/max буферов
             if hasattr(self, 'psyche_influence_min'):
                 target = max(self.psyche_influence_min.item(), 
                             min(self.psyche_influence_max.item(), target))
             
-            # Плавное обновление целевого значения
             if not hasattr(self, 'psyche_influence_target'):
                 self.register_buffer('psyche_influence_target', torch.tensor(target))
                 self.register_buffer('psyche_influence_dynamic', torch.tensor(target))
@@ -3178,12 +3189,10 @@ class DynamicPsycheCoreV6(nn.Module):
                 self.register_buffer('psyche_influence_min', torch.tensor(0.10))
                 self.register_buffer('psyche_influence_max', torch.tensor(0.45))
             
-            # Обновляем целевое значение с EMA
             self.psyche_influence_target.data = (
                 self.psyche_influence_target * 0.95 + target * 0.05
             )
             
-            # Обновляем динамическое значение с инерцией
             acceleration = (self.psyche_influence_target - self.psyche_influence_dynamic) * 0.1
             self.psyche_influence_velocity.data = (
                 self.psyche_influence_velocity * self.psyche_influence_inertia + acceleration
@@ -3194,30 +3203,23 @@ class DynamicPsycheCoreV6(nn.Module):
                 self.psyche_influence_max.item()
             )
             
-            # Логируем изменения
             if self.total_ticks.item() % 200 == 0:
                 logger.info(f"🎛️ Динамическая сила влияния: target={self.psyche_influence_target.item():.3f}, "
                            f"current={self.psyche_influence_dynamic.item():.3f}, "
                            f"stability={stability:.2f}, entropy={entropy:.2f}, mood={mood_abs:.2f}")
         
-        # ===================================================================
-        # 🔥 ВНУТРЕННЕЕ ОБНОВЛЕНИЕ КОНТРОЛЛЕРА С ПОЛНОЙ ИЗОЛЯЦИЕЙ
-        # Используем существующий _perform_ppo_update
-        # ===================================================================
-        if hasattr(self, 'controller') and self.controller is not None:
+        # 🔥 ОБНОВЛЕНИЕ КОНТРОЛЛЕРА ТОЛЬКО ЕСЛИ ВКЛЮЧЕН PPO
+        if hasattr(self, 'controller') and self.controller is not None and self.ppo_enabled:
             try:
-                if self.controller.should_update():
-                    # 🔥 Полная изоляция от основного градиентного потока
+                # Проверяем, есть ли обучаемые параметры
+                has_trainable = any(p.requires_grad for p in self.controller.parameters())
+                
+                if has_trainable and self.controller.should_update():
                     with torch.no_grad():
                         with torch.random.fork_rng():
-                            # Сохраняем режим обучения контроллера
                             was_training = self.controller.training
                             self.controller.train()
-                            
-                            # Вызываем существующий метод PPO обновления
                             self._perform_ppo_update()
-                            
-                            # Возвращаем режим
                             self.controller.train(was_training)
             except Exception as e:
                 logger.debug(f"⚠ Ошибка обновления контроллера: {e}")
@@ -3225,7 +3227,6 @@ class DynamicPsycheCoreV6(nn.Module):
         return self.get_memory_control_signals() if hasattr(self, 'get_memory_control_signals') else {}
     
     def _core_tick_logic(self, device, exp_count):
-        """🧠 ЕДИНАЯ логика тика (без дублирования кода) с адаптивным decay utility"""
         if torch.isnan(self.trait_raw).any() or torch.isinf(self.trait_raw).any():
             logger.warning("⚠ NaN/Inf в trait_raw, сбрасываю состояние психики")
             with torch.no_grad():
@@ -3338,7 +3339,6 @@ class DynamicPsycheCoreV6(nn.Module):
         
         self._apply_extreme_correction(trait_values)
         
-        # Сохраняем драйвы ДО обновления
         prev_drives = self.get_drive_values().detach().clone()
         
         drive_dynamics = self.dynamics.compute_drive_dynamics(drive_values, trait_values)
@@ -3352,12 +3352,19 @@ class DynamicPsycheCoreV6(nn.Module):
             
         self.drive_values.data.clamp_(0.05, 0.95)
         
-        # Вычисляем reward ПОСЛЕ обновления драйвов
         current_drives = self.get_drive_values().detach()
         reward = self.calculate_intrinsic_reward(prev_drives, current_drives)
         
-        # Обновляем контроллер
-        self.update_controller(reward, done=False)
+        # 🔥 ПРОВЕРКА: обновляем контроллер только если его параметры обучаемы
+        if hasattr(self, 'controller') and self.controller is not None:
+            # Проверяем, есть ли обучаемые параметры в контроллере
+            has_trainable = any(p.requires_grad for p in self.controller.parameters())
+            
+            if has_trainable:
+                self.update_controller(reward, done=False)
+            elif self.total_ticks.item() % 200 == 0:
+                logger.debug("⏭️ update_controller пропущен: параметры контроллера заморожены")
+        
         self.apply_reinforcement(reward, learning_rate=0.006)
         
         with torch.no_grad():
@@ -3380,24 +3387,7 @@ class DynamicPsycheCoreV6(nn.Module):
                     self.trait_raw.data.add_(perturbation)
                     self._stability_counter.zero_()
             else:
-                self._stability_counter.data.clamp_(max=self._stability_counter.item() - 2)
-        
-        # ===================================================================
-        # ✅ АДАПТИВНЫЙ DECAY ДЛЯ UTILITY
-        # ===================================================================
-        with torch.no_grad():
-            if hasattr(self.dynamics, '_system_entropy'):
-                usage_rate = 1.0 - self.dynamics._system_entropy.item()
-                base_decay = 0.995
-                decay = base_decay + 0.004 * min(1.0, usage_rate)
-                
-                # Применяем decay к utility если есть такая возможность
-                if hasattr(self, 'slot_utility'):
-                    self.slot_utility *= decay
-                    
-                    # Логируем (редко)
-                    if self.total_ticks.item() % 500 == 0:
-                        logger.debug(f"📊 Utility decay: usage_rate={usage_rate:.3f}, decay={decay:.4f}")
+                self._stability_counter.data.clamp_(max=self._stability_counter.item() - 2)              
     
     def _compute_enhanced_homeostasis_forces(self, trait_values: torch.Tensor) -> torch.Tensor:
         device = trait_values.device
@@ -3742,7 +3732,7 @@ class DynamicPsycheCoreV6(nn.Module):
         Args:
             hidden_states: либо torch.Tensor, либо tuple от модели
         Returns:
-            torch.Tensor: модифицированные скрытые состояния (той же размерности, что и вход)
+            torch.Tensor: модифицированные скрытые состояния
         """
         # Защита от tuple
         if isinstance(hidden_states, tuple):
@@ -3824,16 +3814,36 @@ class DynamicPsycheCoreV6(nn.Module):
         influence = torch.tanh(influence * 0.6)
         influence = torch.clamp(influence, -1.5, 1.5)
         
-        # Итоговое добавление
-        result = hidden_states + influence * 0.25
+        # ===========================================================
+        # 🔥 ИСПРАВЛЕНИЕ: Убираем хардкорную RMS нормализацию!
+        # Вместо этого используем LayerNorm + гейт
+        # ===========================================================
         
-        # RMS нормализация
-        rms = result.pow(2).mean(dim=-1, keepdim=True).sqrt()
-        target_rms = 0.65
-        result = result * target_rms / (rms + 1e-6)
+        # Создаём гейт, который учится с нуля (инициализация нулём)
+        if not hasattr(self, '_influence_gate'):
+            self.register_buffer('_influence_gate_logit', torch.tensor(-3.0))  # sigmoid(-3) ≈ 0.05
+            self.register_buffer('_influence_norm', torch.zeros(1, hidden_dim, device=device))
+            
+            # Создаём LayerNorm для residual stream
+            self._influence_layer_norm = nn.LayerNorm(hidden_dim)
+            self._influence_layer_norm.to(device)
         
-        # Дополнительная защита
-        result = torch.clamp(result, -8.0, 8.0)
+        # Вычисляем гейт (sigmoid от обучаемого параметра)
+        gate = torch.sigmoid(self._influence_gate_logit)
+        
+        # Применяем LayerNorm к influence перед добавлением
+        influence_normed = self._influence_layer_norm(influence)
+        
+        # Добавляем с гейтом — в начале обучения влияние близко к нулю!
+        result = hidden_states + gate * influence_normed * 0.25
+        
+        # 🔥 УБРАНО: хардкорная RMS нормализация!
+        # rms = result.pow(2).mean(dim=-1, keepdim=True).sqrt()
+        # target_rms = 0.65
+        # result = result * target_rms / (rms + 1e-6)
+        
+        # Дополнительная защита только от экстремальных выбросов
+        result = torch.clamp(result, -10.0, 10.0)
         
         # Возвращаем в исходной размерности
         if was_2d:
@@ -4587,121 +4597,9 @@ class Thalia(GPT2LMHeadModel):
             'controller_updated': deque(maxlen=10),
         }
         self.register_buffer("last_surprise", torch.tensor(0.0))
-        
-        # ===================================================================
-        # 🔥 EMBEDDING GRADIENT SCALING — архитектурная защита wte/wpe
-        # ===================================================================
-        if hasattr(self.transformer, 'wte'):
-            # Основные токен-эмбеддинги — самые "грязные" градиенты
-            self.transformer.wte.weight.register_hook(
-                lambda grad: grad * 0.08   # 12.5x ослабление — сладкая зона
-            )
-            logger.info("🛡️ Backward hook на wte: градиенты уменьшены в 12.5 раз")
-
-        if hasattr(self.transformer, 'wpe'):
-            # Позиционные эмбеддинги — можно мягче
-            self.transformer.wpe.weight.register_hook(
-                lambda grad: grad * 0.35
-            )
-            logger.info("🛡️ Backward hook на wpe: градиенты уменьшены в ~3 раза")
-        
-        # ===================================================================
-        # 🔥 DYNAMIC SELECTIVE BACKWARD HOOKS — прицельная защита горячих слоёв
-        # ===================================================================
-        if hasattr(self.transformer, 'h'):
-            total_layers = len(self.transformer.h)
-            
-            # Динамически вычисляем "горячую" середину (от 30% до 75% глубины)
-            # Для 12 слоев это будут слои с 3 по 8
-            start_idx = int(total_layers * 0.3)
-            end_idx = int(total_layers * 0.75)
-            
-            hot_layers = list(range(start_idx, end_idx))
-            
-            for i in hot_layers:
-                block = self.transformer.h[i]
-                
-                # Главный виновник — c_attn (query+key+value)
-                if hasattr(block.attn, 'c_attn'):
-                    block.attn.c_attn.weight.register_hook(lambda grad: grad * 0.25)
-                    if block.attn.c_attn.bias is not None:
-                        block.attn.c_attn.bias.register_hook(lambda grad: grad * 0.25)
-                
-                # c_proj тоже иногда шумит
-                if hasattr(block.attn, 'c_proj'):
-                    block.attn.c_proj.weight.register_hook(lambda grad: grad * 0.35)
-                
-                # MLP (c_fc + c_proj) — на всякий случай
-                if hasattr(block, 'mlp') and hasattr(block.mlp, 'c_fc'):
-                    block.mlp.c_fc.weight.register_hook(lambda grad: grad * 0.30)
-                
-                # c_proj в MLP тоже ослабляем
-                if hasattr(block, 'mlp') and hasattr(block.mlp, 'c_proj'):
-                    block.mlp.c_proj.weight.register_hook(lambda grad: grad * 0.30)
-            
-            logger.info(f"🛡️ Dynamic gradient scaling активирован для слоёв {hot_layers} (из {total_layers})")
                 
         logger.info(f"🧠 Thalia v9.1 с Hebb-памятью и темпоральным циклом инициализирована")
     
-    def parameters(self, recurse=True):
-        """
-        🔥 АВТО-ИЗОЛЯЦИЯ: Исключает personality_core из основного оптимизатора.
-        Психика обучается только внутренними механизмами (PPO/tick), 
-        чтобы не было конфликта градиентов с основным LM-лоссом.
-        """
-        for name, param in super().named_parameters(recurse=recurse):
-            # Исключаем всю психику, так как у неё свой оптимизатор и логика обновлений
-            if 'personality_core' not in name:
-                yield param
-
-    def _register_hebb_hooks(self):
-        """🔥 Внедряет Hebb-слои прямо в блоки GPT-2 через forward hooks"""
-        if not self.use_hebb_layers or self.hebb_layers is None:
-            return
-            
-        total_layers = len(self.transformer.h)
-        # Инициализируем хранилище для лоссов
-        self._hebb_aux_losses = [torch.tensor(0.0, device=self.config.device) for _ in range(total_layers)]
-            
-        for layer_idx, hebb_layer in enumerate(self.hebb_layers):
-            if layer_idx >= total_layers:
-                break
-                    
-            target_block = self.transformer.h[layer_idx]
-                    
-            def make_hook(hebb, idx):
-                def hook(module, args, output):
-                    # output в GPT-2 — это кортеж: (hidden_states, presents, attentions)
-                    hidden_states = output[0]
-                    
-                    # 🔥 Отсекаем градиенты для трансформера, 
-                    # чтобы память училась автономно, не ломая wte/wpe
-                    hebb_input = hidden_states.detach() 
-                    
-                    # Вызываем Hebb БЕЗ no_grad, чтобы его внутренний контроллер мог учиться!
-                    modified_hidden, aux_loss = hebb(
-                        hidden_states=hebb_input,
-                        attention_mask=None,
-                        # Динамические сигналы читаем из атрибутов модели
-                        surprise=getattr(self, 'current_surprise', 0.0), 
-                        signals=getattr(self, 'current_memory_controls', None)
-                    )
-                    
-                    # Сохраняем aux_loss (detach для хранения, но requires_grad остаётся)
-                    if aux_loss is not None and aux_loss.requires_grad:
-                        self._hebb_aux_losses[idx] = aux_loss
-                    else:
-                        self._hebb_aux_losses[idx] = torch.tensor(0.0, device=hidden_states.device)
-                    
-                    # 🔥 Возвращаем кортеж с модифицированным hidden_states
-                    return (modified_hidden,) + output[1:]
-                    
-                return hook
-                    
-            target_block.register_forward_hook(make_hook(hebb_layer, layer_idx))
-            
-        logger.info(f"🔗 Hebb-слои бесшовно интегрированы в {len(self.hebb_layers)} блоков GPT-2")
- 
     def compute_alignment_losses(self):
         """Стабилизация всех пространств представлений"""
         losses = {}
@@ -4781,32 +4679,65 @@ class Thalia(GPT2LMHeadModel):
         else:
             logger.warning("⚠ slot_utility не найден в центроидной памяти")
 
+    def _register_hebb_hooks(self):
+        """🔥 Внедряет Hebb-слои прямо в блоки GPT-2 через forward hooks"""
+        if not self.use_hebb_layers or self.hebb_layers is None:
+            return
+            
+        total_layers = len(self.transformer.h)
+        # Инициализируем хранилище для лоссов
+        self._hebb_aux_losses = [torch.tensor(0.0, device=self.config.device) for _ in range(total_layers)]
+            
+        for layer_idx, hebb_layer in enumerate(self.hebb_layers):
+            if layer_idx >= total_layers:
+                break
+                    
+            target_block = self.transformer.h[layer_idx]
+                    
+            def make_hook(hebb, idx):
+                def hook(module, args, output):
+                    # output в GPT-2 — это кортеж: (hidden_states, presents, attentions)
+                    hidden_states = output[0]
+                    
+                    # 🔥 Отсекаем градиенты для трансформера, 
+                    # чтобы память училась автономно, не ломая wte/wpe
+                    hebb_input = hidden_states.detach() 
+                    
+                    # Вызываем Hebb БЕЗ no_grad, чтобы его внутренний контроллер мог учиться!
+                    modified_hidden, aux_loss = hebb(
+                        hidden_states=hebb_input,
+                        attention_mask=None,
+                        # Динамические сигналы читаем из атрибутов модели
+                        surprise=getattr(self, 'current_surprise', 0.0), 
+                        signals=getattr(self, 'current_memory_controls', None)
+                    )
+                    
+                    # Сохраняем aux_loss (detach для хранения, но requires_grad остаётся)
+                    if aux_loss is not None and aux_loss.requires_grad:
+                        self._hebb_aux_losses[idx] = aux_loss
+                    else:
+                        self._hebb_aux_losses[idx] = torch.tensor(0.0, device=hidden_states.device)
+                    
+                    # 🔥 Возвращаем кортеж с модифицированным hidden_states
+                    return (modified_hidden,) + output[1:]
+                    
+                return hook
+                    
+            target_block.register_forward_hook(make_hook(hebb_layer, layer_idx))
+            
+        logger.info(f"🔗 Hebb-слои бесшовно интегрированы в {len(self.hebb_layers)} блоков GPT-2")
+
     def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
         self.step_count += 1
         
-        # ===================================================================
-        # 🔥 Подготавливаем динамические сигналы для хуков
-        # ===================================================================
         if self.personality_core is not None:
             if self.training:
                 self.personality_core.tick(training=True)
             else:
                 self.personality_core.tick(training=False)
-            
-            self.current_memory_controls = self.personality_core.get_memory_control_signals()
-        else:
-            self.current_memory_controls = None
-            
-        self.current_surprise = getattr(self, '_last_surprise', 0.0)
-
-        # Очищаем лоссы перед проходом
-        if hasattr(self, '_hebb_aux_losses'):
-            device = input_ids.device if input_ids is not None else self.config.device
-            for i in range(len(self._hebb_aux_losses)):
-                self._hebb_aux_losses[i] = torch.tensor(0.0, device=device)
-
+        
         # ===================================================================
-        # 🔥🔥🔥 УРОВЕНЬ 1: Родной трансформер (Hebb отрабатывает внутри хуков)
+        # 🔥🔥🔥 УРОВЕНЬ 1: Родной трансформер
         # ===================================================================
         transformer_outputs = self.transformer(
             input_ids=input_ids,
@@ -4820,17 +4751,160 @@ class Thalia(GPT2LMHeadModel):
         attention_patterns = transformer_outputs.attentions
         all_hidden_states = list(transformer_outputs.hidden_states)
         
-        # ===================================================================
-        # 🔥 Сбор aux_losses для градиентного шага контроллеров Hebb
-        # ===================================================================
-        total_hebb_aux_loss = torch.tensor(0.0, device=hidden_states.device)
-        if hasattr(self, '_hebb_aux_losses'):
-            for aux_loss in self._hebb_aux_losses:
-                if isinstance(aux_loss, torch.Tensor) and aux_loss.requires_grad:
-                    total_hebb_aux_loss = total_hebb_aux_loss + torch.clamp(aux_loss, 0.0, 5.0)
+        memory_controls = {}
+        if self.personality_core is not None:
+            memory_controls = self.personality_core.get_memory_control_signals()
+        
+        mamba_hidden_for_exchange = None
+        surprise = 0.0
+        base_surprise = 0.0
+        memory_result = {}
         
         # ===================================================================
-        # УРОВЕНЬ 2: ЭМОЦИОНАЛЬНАЯ МОДУЛЯЦИЯ
+        # 🔥🔥🔥 УРОВЕНЬ 2: HEBB + СИНХРОНИЗАЦИЯ ПАР ДЛЯ ALIGNMENT
+        # ===================================================================
+        total_hebb_aux_loss = torch.tensor(0.0, device=hidden_states.device)
+        hebb_novelty_boost = 0.0
+
+        if self.use_hebb_layers and self.hebb_layers is not None:
+            n_layers = len(self.hebb_layers)
+            group_filled = {0: 0, 1: 0, 2: 0}
+            group_capacity = {0: 0, 1: 0, 2: 0}
+            
+            for i, layer in enumerate(self.hebb_layers):
+                g_id = (i * 3) // max(n_layers, 1)
+                group_filled[g_id] += int(layer.initialized_slots.item())
+                group_capacity[g_id] += layer.num_slots
+            
+            group_ratios = {g: (group_filled[g] / group_capacity[g] if group_capacity[g] > 0 else 0.0) for g in range(3)}
+            
+            original_shape = hidden_states.shape
+            if self.step_count % 200 == 0:
+                logger.debug(f"🔍 original_shape: {original_shape}")
+            
+            for layer_idx, hebb_layer in enumerate(self.hebb_layers):
+                if layer_idx + 1 >= len(all_hidden_states):
+                    continue
+                    
+                layer_hidden = all_hidden_states[layer_idx + 1]
+                
+                if self.step_count % 200 == 0:
+                    logger.debug(f"🔍 layer_hidden[{layer_idx}].shape = {layer_hidden.shape}")
+                
+                g_id = (layer_idx * 3) // max(n_layers, 1)
+                
+                h_signals = {
+                    'write_gate': memory_controls.get('hebb_write_gate', 1.0),
+                    'lr_mult': memory_controls.get('hebb_lr_mult', 1.0),
+                    'stability_factor': memory_controls.get('stability_factor', 0.0),
+                    'attention_temperature': memory_controls.get('attention_temperature', None),
+                    'mood_influence': memory_controls.get('mood_influence', 0.0),
+                    'group_fill_ratio': group_ratios[g_id],
+                    'group_id': g_id
+                }
+                
+                if surprise > 0:
+                    h_signals['surprise'] = surprise
+                
+                hebb_result = hebb_layer(
+                    hidden_states=layer_hidden,
+                    signals=h_signals,
+                    attention_mask=attention_mask,
+                    surprise=surprise
+                )
+
+                if isinstance(hebb_result, tuple):
+                    modified_hidden, layer_aux = hebb_result
+                else:
+                    modified_hidden = hebb_result
+                    layer_aux = None
+                
+                if modified_hidden.dim() == 2 and layer_hidden.dim() == 3:
+                    batch_size = layer_hidden.shape[0]
+                    seq_len = layer_hidden.shape[1]
+                    hidden_dim = modified_hidden.shape[-1]
+                    expected_elements = batch_size * seq_len
+                    actual_elements = modified_hidden.shape[0]
+                    
+                    if expected_elements == actual_elements:
+                        modified_hidden = modified_hidden.view(batch_size, seq_len, hidden_dim)
+                        if self.step_count % 1000 == 0:
+                            logger.debug(f"Восстановлена размерность Hebb слоя {layer_idx}")
+                    else:
+                        logger.debug(f"Размерности не совпадают: {expected_elements} vs {actual_elements}")
+                        modified_hidden = layer_hidden
+                
+                all_hidden_states[layer_idx + 1] = modified_hidden
+                
+                if layer_aux is not None and layer_aux.requires_grad:
+                    total_hebb_aux_loss = total_hebb_aux_loss + torch.clamp(layer_aux, 0.0, 5.0)
+                    hebb_layer._controller_loss_for_backward = layer_aux
+                    if hasattr(hebb_layer, '_controller_loss'):
+                        hebb_layer._controller_loss = layer_aux.detach()
+                
+                if hasattr(hebb_layer, "new_slot_created_this_step") and hebb_layer.new_slot_created_this_step.item() == 1:
+                    hebb_novelty_boost += 0.25
+                    hebb_layer.new_slot_created_this_step.zero_()
+                    
+                    with torch.no_grad():
+                        query = getattr(hebb_layer, '_last_hebb_query', None)
+                        if query is not None and query.norm() > 0.01:
+                            if mamba_hidden_for_exchange is not None:
+                                if mamba_hidden_for_exchange.dim() == 3:
+                                    m_raw = mamba_hidden_for_exchange[:, -1, :].detach()
+                                elif mamba_hidden_for_exchange.dim() == 2:
+                                    m_raw = mamba_hidden_for_exchange.detach()
+                                else:
+                                    m_raw = mamba_hidden_for_exchange.view(-1, self.config.slot_size).detach()
+                            else:
+                                if attention_mask is not None:
+                                    mask = attention_mask.unsqueeze(-1).float()
+                                    m_raw = (hidden_states * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
+                                else:
+                                    m_raw = hidden_states.mean(dim=1)
+                                m_raw = m_raw.detach()
+                            
+                            self.experience_exchange.capture_pair(
+                                t_raw=query.unsqueeze(0),
+                                m_raw=m_raw.unsqueeze(0)
+                            )
+                            
+                            if self.step_count % 100 == 0:
+                                logger.debug(f"🔄 HebbLayer[{layer_idx}] → capture_pair (новый слот!)")
+            
+            if self.step_count % 500 == 0 and self.use_hebb_layers:
+                for i, layer in enumerate(self.hebb_layers):
+                    if i == 0 or i == len(self.hebb_layers)//2 or i == len(self.hebb_layers)-1:
+                        if hasattr(layer, 'analyze_network'):
+                            layer.analyze_network()
+                            if self.step_count % 1000 == 0:
+                                logger.info(f"🔬 Анализ Hebb слоя {i} выполнен")
+                        else:
+                            if hasattr(layer, 'initialized_slots') and hasattr(layer, 'num_slots'):
+                                filled = int(layer.initialized_slots.item())
+                                total = layer.num_slots
+                                ratio = filled / total if total > 0 else 0
+                                logger.info(f"🔬 Hebb слой {i}: {filled}/{total} слотов ({ratio:.1%})")
+            
+            hidden_states = all_hidden_states[-1]
+            
+            if hidden_states.dim() == 2:
+                expected_elements = original_shape[0] * original_shape[1]
+                actual_elements = hidden_states.shape[0]
+                
+                if expected_elements == actual_elements:
+                    hidden_states = hidden_states.view(original_shape)
+                else:
+                    logger.error(f"❌ Критическое несоответствие: {actual_elements} vs {expected_elements}")
+                    hidden_states = torch.zeros(original_shape, device=hidden_states.device, dtype=hidden_states.dtype)
+            
+            all_hidden_states = tuple(all_hidden_states)
+            
+            if self.step_count % 200 == 0:
+                logger.debug(f"🔍 После Hebb: hidden_states.shape = {hidden_states.shape}")
+        
+        # ===================================================================
+        # УРОВЕНЬ 3: ЭМОЦИОНАЛЬНАЯ МОДУЛЯЦИЯ
         # ===================================================================
         if self.personality_core is not None:
             hidden_states = self.personality_core.influence_hidden_states(hidden_states)
@@ -4840,31 +4914,31 @@ class Thalia(GPT2LMHeadModel):
             hidden_states = hidden_states + 0.15 * living_output
         
         # ===================================================================
-        # УРОВЕНЬ 3: ДОЛГОСРОЧНАЯ ПАМЯТЬ
+        # УРОВЕНЬ 4: ДОЛГОСРОЧНАЯ ПАМЯТЬ
         # ===================================================================
-        memory_controls = self.current_memory_controls or {}
-        mamba_hidden_for_exchange = None
-        base_surprise = 0.0
-        memory_result = {}
-        
-        if self.adaptive_memory is not None:
+        transformer_experience = None
+
+        if self.experience_exchange.bidirectional_enabled:
+            generation_metadata = {
+                'step': self.step_count,
+                'input_length': input_ids.shape[1] if input_ids is not None else 0,
+                'training': self.training,
+                'labels_provided': labels is not None,
+                'batch_size': hidden_states.shape[0]
+            }
+            
+            last_layer_attention = attention_patterns[-1] if attention_patterns else None
             transformer_experience = None
-            if self.experience_exchange.bidirectional_enabled:
-                generation_metadata = {
-                    'step': self.step_count,
-                    'input_length': input_ids.shape[1] if input_ids is not None else 0,
-                    'training': self.training,
-                    'labels_provided': labels is not None,
-                    'batch_size': hidden_states.shape[0]
-                }
-            
-            final_control_signals = memory_controls.copy() if memory_controls else {}
-            if self.use_hebb_layers and self.hebb_layers is not None:
-                for layer in reversed(self.hebb_layers):
-                    if hasattr(layer, '_last_hebb_query') and layer._last_hebb_query is not None:
-                        final_control_signals['hebb_query_vector'] = layer._last_hebb_query
-                        break
-            
+
+        final_control_signals = memory_controls.copy() if memory_controls else {}
+
+        if self.use_hebb_layers and self.hebb_layers is not None:
+            for layer in reversed(self.hebb_layers):
+                if hasattr(layer, '_last_hebb_query') and layer._last_hebb_query is not None:
+                    final_control_signals['hebb_query_vector'] = layer._last_hebb_query
+                    break
+
+        if self.adaptive_memory is not None:
             memory_result = self.adaptive_memory(
                 hidden_states=hidden_states,
                 slots=None,
@@ -4872,22 +4946,25 @@ class Thalia(GPT2LMHeadModel):
                 control_signals=final_control_signals
             )
             
+            # 🔥 ИСПРАВЛЕНИЕ: берём мета-лосс напрямую и НЕ сохраняем в переменную
             if 'meta_loss' in memory_result and memory_result['meta_loss'] is not None:
                 meta_loss_tensor = memory_result['meta_loss']
                 if isinstance(meta_loss_tensor, torch.Tensor) and meta_loss_tensor.requires_grad:
+                    # Сохраняем для добавления в общий loss
                     self._current_meta_loss = meta_loss_tensor
                     if self.step_count % 50 == 0:
-                        logger.info(f"🧠 Meta loss получен: {meta_loss_tensor.item():.6f}")
+                        logger.info(f"🧠 Meta loss получен: {meta_loss_tensor.item():.6f} (requires_grad=True)")
                 else:
                     self._current_meta_loss = None
             else:
                 self._current_meta_loss = None
             
+            # Извлекаем мета-когнитивную информацию
             if 'meta_cognitive' in memory_result:
                 self._last_meta = memory_result['meta_cognitive']
             
             base_surprise = memory_result.get('surprise', 0.0) if memory_result else 0.0
-            surprise = base_surprise
+            surprise = base_surprise + hebb_novelty_boost
             surprise = min(1.0, surprise)
             
             self.last_surprise.fill_(surprise)
@@ -4921,9 +4998,9 @@ class Thalia(GPT2LMHeadModel):
                         )
                 except Exception as e:
                     logger.debug(f"⚠ ingest_memory_experience: {e}")
-        
+
         # ===================================================================
-        # УРОВЕНЬ 4: СИМБИОЗ И ОБМЕН ОПЫТОМ
+        # Синхронизированная запись пар для alignment
         # ===================================================================
         if self.experience_exchange.bidirectional_enabled and mamba_hidden_for_exchange is not None:
             if attention_mask is not None:
@@ -4940,24 +5017,58 @@ class Thalia(GPT2LMHeadModel):
                 m_raw = mamba_hidden_for_exchange.view(-1, self.config.slot_size)
             
             if t_raw.shape[0] != m_raw.shape[0]:
+                if self.step_count % 200 == 0:
+                    logger.debug(f"⚠️ Выравнивание batch_size: t={t_raw.shape[0]}, m={m_raw.shape[0]}")
+                
                 min_batch = min(t_raw.shape[0], m_raw.shape[0])
+                
                 if min_batch > 0:
                     t_raw_aligned = t_raw[:min_batch]
                     m_raw_aligned = m_raw[:min_batch]
                     
-                    if not (torch.isnan(t_raw_aligned).any() or torch.isinf(t_raw_aligned).any() or
+                    if not (torch.isnan(t_raw_aligned).any() or torch.isinf(t_raw_aligned).any() or 
                             torch.isnan(m_raw_aligned).any() or torch.isinf(m_raw_aligned).any()):
+                        
                         t_raw_norm = F.normalize(t_raw_aligned, dim=-1)
                         m_raw_norm = F.normalize(m_raw_aligned, dim=-1)
+                        
                         self.experience_exchange.capture_pair(t_raw_norm, m_raw_norm)
+                        
+                        if self.step_count % 200 == 0:
+                            cos_sim = F.cosine_similarity(
+                                t_raw_norm.mean(dim=0, keepdim=True), 
+                                m_raw_norm.mean(dim=0, keepdim=True)
+                            ).item()
+                            logger.debug(f"📸 Захвачена пара (выровнена): batch={min_batch}, "
+                                       f"cos_sim={cos_sim:.4f}")
+                else:
+                    if self.step_count % 200 == 0:
+                        logger.warning(f"⚠️ Пропуск пары: min_batch={min_batch}")
             else:
-                if not (torch.isnan(t_raw).any() or torch.isinf(t_raw).any() or
+                if not (torch.isnan(t_raw).any() or torch.isinf(t_raw).any() or 
                         torch.isnan(m_raw).any() or torch.isinf(m_raw).any()):
+                    
                     t_raw_norm = F.normalize(t_raw, dim=-1)
                     m_raw_norm = F.normalize(m_raw, dim=-1)
+                    
                     self.experience_exchange.capture_pair(t_raw_norm, m_raw_norm)
-            
+                    
+                    if self.step_count % 200 == 0:
+                        cos_sim = F.cosine_similarity(
+                            t_raw_norm.mean(dim=0, keepdim=True), 
+                            m_raw_norm.mean(dim=0, keepdim=True)
+                        ).item()
+                        logger.debug(f"📸 Захвачена пара: batch={t_raw.shape[0]}, cos_sim={cos_sim:.4f}")
+                else:
+                    if self.step_count % 200 == 0:
+                        logger.warning("⚠️ Пропуск пары: обнаружены NaN/Inf")
+                                
+        # ===================================================================
+        # УРОВЕНЬ 5: ИНТЕГРАЦИЯ И СИМБИОЗ
+        # ===================================================================
+        if self.experience_exchange.bidirectional_enabled:
             exchange_mode = 'mutual_enhancement'
+            
             if not self.training:
                 if memory_result and memory_result.get('surprise', 0) > 0.3:
                     exchange_mode = 'mamba_filtering'
@@ -4971,49 +5082,27 @@ class Thalia(GPT2LMHeadModel):
             )
         
         # ===================================================================
-        # УРОВЕНЬ 5: ВЫХОД
+        # УРОВЕНЬ 6: ВЫХОД
         # ===================================================================
         lm_logits = self.lm_head(hidden_states)
         
-        # ===================================================================
-        # 🔥 ВЫЧИСЛЕНИЕ LOSS
-        # ===================================================================
         loss = None
         if labels is not None:
             shift_logits = lm_logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             
             if shift_logits.numel() > 0 and shift_labels.numel() > 0:
-                ce_loss = F.cross_entropy(
-                    shift_logits.view(-1, shift_logits.size(-1)),
+                main_loss = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)), 
                     shift_labels.view(-1),
-                    ignore_index=-100,
-                    reduction='none'
+                    ignore_index=-100
                 )
-                
-                batch_size = shift_logits.shape[0]
-                seq_len = shift_logits.shape[1]
-                ce_loss = ce_loss.view(batch_size, seq_len)
-                mask = (shift_labels != -100).float()
-                per_sample_loss = (ce_loss * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
-                
-                max_weight = getattr(self.config, 'uncertainty_weight_max', 3.0)
-                if hasattr(self, '_last_meta') and self._last_meta is not None:
-                    confidence = self._last_meta.get('confidence')
-                    if confidence is not None:
-                        if isinstance(confidence, torch.Tensor) and confidence.shape[0] == batch_size:
-                            weights = 1.0 + (1.0 - confidence) * (max_weight - 1.0)
-                            weights = weights / weights.mean()
-                            per_sample_loss = per_sample_loss * weights
-                        elif isinstance(confidence, (float, int)):
-                            weight = 1.0 + (1.0 - confidence) * (max_weight - 1.0)
-                            per_sample_loss = per_sample_loss * weight
-                
-                loss = per_sample_loss.mean()
+                loss = main_loss
         
         # ===================================================================
-        # 🔥 ДОПОЛНИТЕЛЬНЫЕ LOSS КОМПОНЕНТЫ
+        # 🔥 ВЫЧИСЛЕНИЕ LOSS (исправленная версия с мета-когнитивным влиянием)
         # ===================================================================
+        
         if self.training and loss is not None:
             if total_hebb_aux_loss.numel() > 0 and total_hebb_aux_loss.requires_grad:
                 hebb_loss = total_hebb_aux_loss.sum() if total_hebb_aux_loss.dim() > 0 else total_hebb_aux_loss
@@ -5176,13 +5265,9 @@ class Thalia(GPT2LMHeadModel):
                     n_blocks += 1
                 
                 if n_blocks > 0:
-                    # 🔥 Берём реальное количество слотов из первого слоя
-                    actual_slots_per_layer = self.hebb_layers[0].num_slots
-                    total_slots = n_blocks * actual_slots_per_layer
-                    
                     logger.info(
                         f"🧠 HEBB: active={total_active}/{total_initialized} "
-                        f"(init={total_initialized}/{total_slots}), "  # ← теперь правильно
+                        f"(init={total_initialized}/{n_blocks*64}), "
                         f"updates={total_updates}, reads={total_reads}, "
                         f"utility={total_utility/n_blocks:.3f}, "
                         f"surprise={surprise:.3f}, aux_loss={hebb_loss:.4f}"
@@ -5290,82 +5375,111 @@ class Thalia(GPT2LMHeadModel):
     
     def prepare_generation_params(self, input_ids=None, **kwargs):
         """
-        🔥 v3.4 Quality Fix — Борьба с корявыми словами и галлюцинациями
+        🔥 УЛУЧШЕННЫЙ: Интеграция с мета-сетью v3.2
+        Параметры генерации теперь учитывают внутренний голос модели
         """
+        # Базовые параметры от психики
         if self.personality_core is None:
             return self._default_params(kwargs)
-
+        
         self.personality_core.tick(training=False)
         report = self.personality_core.get_detailed_report()
-        meta = self.get_meta_cognitive_state()
-
+        
         mood = report.get('mood', {}).get('state', 0.0)
         entropy = report.get('system_state', {}).get('entropy', 0.5)
         stability = report.get('system_state', {}).get('stability', 0.5)
         creativity = report.get('traits', {}).get('creativity', 0.5)
-
+        
         drives = report.get('drives', {})
         curiosity_level = drives.get('novelty', 0.5)
         fatigue_level = drives.get('fatigue', 0.5)
-
-        # Мета-состояние
-        meta_conf = meta.get('confidence', 0.5)
-        meta_doubt = meta.get('doubt', 0.4)
-        meta_curiosity = meta.get('curiosity', 0.7)
-        meta_decision = meta.get('decision', 'act')
-
-        # ==================== КЛЮЧЕВЫЕ ИЗМЕНЕНИЯ ====================
-
-        # 1. Температура — строже при высокой уверенности
-        temp = 0.65 + (curiosity_level * 0.38) + (creativity * 0.28) - (stability * 0.18)
-        temp = temp * (1.0 + meta_curiosity * 0.18)      # любопытство немного повышает
-        temp = temp * (1.0 - meta_conf * 0.28)           # уверенность сильно понижает
-        temp = max(0.52, min(1.45, temp))                # жёсткий потолок
-
-        # 2. Top_p — более консервативный
-        top_p = 0.88 + ((curiosity_level - 0.5) * 0.14) - (fatigue_level * 0.12)
-        top_p = max(0.80, min(0.96, top_p))
-
-        # 3. Top_k — ограничиваем выбор
-        top_k = int(30 + (curiosity_level * 25) - (fatigue_level * 15))
-        top_k = max(20, min(70, top_k))
-
-        # 4. Repetition penalty — СИЛЬНЕЕ против корявых слов
-        rep_penalty = 1.12 + (fatigue_level * 0.15) + (meta_doubt * 0.22)
         
-        # 🔥 ДОПОЛНИТЕЛЬНЫЙ ШТРАФ ЗА "МУСОРНЫЕ" ТОКЕНЫ В КРЕАТИВНЫХ РЕЖИМАХ
-        if meta_decision in ["explore", "deep_rethink"]:
-            rep_penalty = rep_penalty + 0.12
+        # ===========================================================
+        # 🔥 ИНТЕГРАЦИЯ С МЕТА-СЕТЬЮ v3.2
+        # ===========================================================
+        meta_state = self.get_meta_cognitive_state() if hasattr(self, 'get_meta_cognitive_state') else {}
         
-        rep_penalty = max(1.08, min(1.45, rep_penalty))
-
-        # 5. Минимальная длина — защита от обрывов
-        min_keep = 6
-        if meta_decision in ["deep_rethink", "explore"]:
-            min_keep = 12
-        elif meta_decision == "think":
-            min_keep = 9
-
-        # 6. Максимальная длина
+        # Извлекаем мета-показатели
+        meta_confidence = meta_state.get('confidence', 0.5)
+        meta_doubt = meta_state.get('doubt', 0.3)
+        meta_curiosity = meta_state.get('curiosity', 0.5)
+        meta_decision = meta_state.get('decision', 'act')
+        
+        # ===========================================================
+        # 🔥 АДАПТАЦИЯ ПАРАМЕТРОВ НА ОСНОВЕ МЕТА-СОСТОЯНИЯ
+        # ===========================================================
+        
+        # 1. Температура: 
+        #    - Высокое любопытство → выше температура (больше экспериментов)
+        #    - Высокая уверенность → ниже температура (точнее)
+        temp = 0.70 + (curiosity_level * 0.4) + (creativity * 0.3) - (stability * 0.1)
+        temp = temp * (1.0 + meta_curiosity * 0.2)  # мета-любопытство увеличивает
+        temp = temp * (1.0 - meta_confidence * 0.15)  # мета-уверенность уменьшает
+        temp = max(0.55, min(1.6, temp))
+        
+        # 2. Top_p (разнообразие):
+        #    - Высокое любопытство → шире выбор
+        #    - Высокая уверенность → уже выбор
+        top_p = 0.92 + ((curiosity_level - 0.5) * 0.15) - (fatigue_level * 0.12) + ((entropy - 0.5) * 0.1)
+        top_p = top_p * (1.0 + meta_curiosity * 0.1)  # любопытство расширяет
+        top_p = top_p * (1.0 - meta_confidence * 0.1)  # уверенность сужает
+        top_p = max(0.75, min(0.99, top_p))
+        
+        # 3. Top_k
+        top_k = int(40 + (curiosity_level * 30) - (fatigue_level * 20) + (entropy * 10))
+        top_k = int(top_k * (1.0 + meta_curiosity * 0.15))
+        top_k = max(20, min(100, top_k))
+        
+        # 4. Repetition penalty
+        rep_penalty = 1.05 + (fatigue_level * 0.2) + ((1 - creativity) * 0.1)
+        # Мета-сомнение увеличивает penalty (меньше повторений)
+        rep_penalty = rep_penalty * (1.0 + meta_doubt * 0.2)
+        rep_penalty = max(1.02, min(1.35, rep_penalty))
+        
+        # 5. Минимальное количество токенов для keep
+        creativity_norm = (creativity + 1) / 2 
+        min_keep = int(2 + (6 - 2) * creativity_norm)
+        # Если решение "think" или "deep_rethink" — увеличиваем
+        if meta_decision in ["think", "deep_rethink"]:
+            min_keep = min_keep * 2
+        min_keep = max(2, min(12, min_keep))
+        
+        # 6. Максимальное количество токенов
         base_max = kwargs.get('max_new_tokens', 1024)
-        length_factor = 1.0
-        if meta_decision == "deep_rethink":
-            length_factor = 1.55
-        elif meta_decision == "explore":
-            length_factor = 1.35
+        stability_factor = max(0.4, stability)
+        curiosity_factor = 1.0 + (curiosity_level * 0.25)
+        max_new_tokens_clamped = int(base_max * stability_factor * curiosity_factor)
+        
+        # 🔥 МЕТА-КОРРЕКЦИЯ: если решение "explore" — генерируем больше
+        if meta_decision == "explore":
+            max_new_tokens_clamped = int(max_new_tokens_clamped * 1.3)
+        # Если "act" — можно меньше
         elif meta_decision == "act":
-            length_factor = 0.85
-
-        max_new_tokens_clamped = int(base_max * length_factor)
-        max_new_tokens_clamped = max(90, min(base_max, max_new_tokens_clamped))
-
-        # 7. CoT multiplier — сильнее для рефлексии
-        cot_multiplier = 1.2
+            max_new_tokens_clamped = int(max_new_tokens_clamped * 0.9)
+        
+        max_new_tokens_clamped = max(60, min(base_max, max_new_tokens_clamped))
+        
+        # 7. CoT множитель
+        cot_multiplier = 1.1 + (entropy - 0.5) * 0.6
+        # Если решение "deep_rethink" — увеличиваем CoT
         if meta_decision == "deep_rethink":
-            cot_multiplier = 1.85
-        elif meta_decision == "explore":
-            cot_multiplier = 1.55
-
+            cot_multiplier = cot_multiplier * 1.3
+        cot_multiplier = max(1.1, min(1.6, cot_multiplier))
+        
+        # 8. No repeat ngram size
+        no_repeat = 2 + int(stability * 1.5)
+        no_repeat = min(4, no_repeat)
+        
+        # 9. Early stopping
+        # Если уверенность высокая — можно останавливаться раньше
+        early_stopping = meta_confidence > 0.7
+        
+        # 10. Добавляем параметры для борьбы с короткими генерациями
+        min_new_tokens = kwargs.get('min_new_tokens', 30)
+        # Если модель слишком быстро останавливается, увеличиваем min_new_tokens
+        if meta_decision in ["explore", "deep_rethink"]:
+            min_new_tokens = max(50, min_new_tokens)
+        
         return {
             'temperature': temp,
             'top_p': top_p,
@@ -5373,12 +5487,17 @@ class Thalia(GPT2LMHeadModel):
             'repetition_penalty': rep_penalty,
             'min_tokens_to_keep': min_keep,
             'max_new_tokens_clamped': max_new_tokens_clamped,
+            'min_new_tokens': min_new_tokens,
             'cot_temperature_multiplier': cot_multiplier,
-            'no_repeat_ngram_size': 4 if meta_doubt > 0.35 else 3,
-            'early_stopping': meta_conf > 0.78,
-            'meta_decision': meta_decision,
-            'meta_confidence': meta_conf,
+            'no_repeat_ngram_size': no_repeat,
+            'early_stopping': early_stopping,
+            'burnout_active': False,
+            # Мета-показатели для логирования
+            'meta_confidence': meta_confidence,
+            'meta_doubt': meta_doubt,
             'meta_curiosity': meta_curiosity,
+            'meta_decision': meta_decision,
+            # Остальные
             'mood': mood,
             'entropy': entropy,
             'creativity': creativity,
@@ -5490,44 +5609,6 @@ class Thalia(GPT2LMHeadModel):
         self.eval()
         device = input_ids.device
 
-        # ===========================================================
-        # 🔥 ДОБАВЛЯЕМ МЯГКИЙ ПРОМТ-КОМПАС (если включён и ещё не вставлен)
-        # ===========================================================
-        if hasattr(self.config, 'use_talia_prompt') and self.config.use_talia_prompt:
-            if not hasattr(self, '_talia_prompt_injected') or not self._talia_prompt_injected:
-                try:
-                    talia_prompt = self.config.get_talia_prompt()
-                    if talia_prompt and self.tokenizer:
-                        # Кодируем промт
-                        prompt_tokens = self.tokenizer.encode(
-                            talia_prompt,
-                            add_special_tokens=False
-                        )
-                        
-                        # Добавляем разделитель для контекста
-                        sep_tokens = self.tokenizer.encode("\n\n---\n\n", add_special_tokens=False)
-                        
-                        # Вставляем в начало
-                        input_ids = torch.cat([
-                            torch.tensor(prompt_tokens, device=device),
-                            torch.tensor(sep_tokens, device=device),
-                            input_ids
-                        ], dim=-1)
-                        
-                        if attention_mask is not None:
-                            attention_mask = torch.cat([
-                                torch.ones(len(prompt_tokens) + len(sep_tokens), device=device),
-                                attention_mask
-                            ], dim=-1)
-                        else:
-                            attention_mask = torch.ones(input_ids.shape[1], device=device)
-                        
-                        self._talia_prompt_injected = True
-                        logger.info(f"📜 Мягкий промт-компас добавлен (длина: {len(prompt_tokens)} токенов)")
-                        
-                except Exception as e:
-                    logger.warning(f"⚠️ Ошибка добавления промт-компаса: {e}")
-
         params = self.prepare_generation_params(
             input_ids=input_ids,
             max_new_tokens=max_new_tokens,
@@ -5537,46 +5618,9 @@ class Thalia(GPT2LMHeadModel):
         # 🔥 ЛОГИРУЕМ МЕТА-СОСТОЯНИЕ ПЕРЕД ГЕНЕРАЦИЕЙ
         if params.get('meta_decision'):
             logger.info(f"🧠 Мета-решение: {params['meta_decision']} "
-                       f"(увер={params.get('meta_confidence', 0):.3f}, "
-                       f"сомнение={params.get('meta_doubt', 0):.3f}, "
-                       f"любопытство={params.get('meta_curiosity', 0):.3f}, "
-                       f"готовность={params.get('meta_readiness', 0):.3f})")
-        
-        # ===========================================================
-        # 🔥 ДОБАВЛЯЕМ THINKING TRACE ПЕРЕД ОСНОВНОЙ ГЕНЕРАЦИЕЙ
-        # ===========================================================
-        if params.get('meta_decision') in ["deep_rethink", "think", "explore"]:
-            # Эмодзи для разных типов решений
-            decision_emoji = {
-                "deep_rethink": "🧠💭",
-                "think": "🤔",
-                "explore": "🔍✨"
-            }
-            emoji = decision_emoji.get(params['meta_decision'], "🧠")
-            
-            logger.info(f"{emoji} [Внутренний голос] → {params['meta_decision'].upper()} | "
-                       f"уверенность={params.get('meta_confidence', 0):.3f} | "
-                       f"сомнение={params.get('meta_doubt', 0):.3f} | "
-                       f"любопытство={params.get('meta_curiosity', 0):.3f}")
-            
-            # Добавляем визуальный thinking trace в промпт (опционально)
-            if params.get('add_thinking_trace', True):
-                trace_prefix = ""
-                if params['meta_decision'] == "deep_rethink":
-                    trace_prefix = "\n\n🧠 *Я чувствую, что нужно глубже обдумать это...*\n\n"
-                elif params['meta_decision'] == "think":
-                    trace_prefix = "\n\n🤔 *Давайте подумаем...*\n\n"
-                elif params['meta_decision'] == "explore":
-                    trace_prefix = "\n\n🔍 *Интересно, что здесь скрывается?*\n\n"
-                
-                if trace_prefix and self.tokenizer:
-                    trace_tokens = self.tokenizer.encode(trace_prefix, add_special_tokens=False)
-                    trace_tensor = torch.tensor(trace_tokens, device=device).unsqueeze(0)
-                    input_ids = torch.cat([input_ids, trace_tensor], dim=-1)
-                    if attention_mask is not None:
-                        attention_mask = torch.cat([attention_mask, torch.ones_like(trace_tensor)], dim=-1)
-                    else:
-                        attention_mask = torch.ones(input_ids.shape[1], device=device)
+                       f"(увер={params['meta_confidence']:.3f}, "
+                       f"сомнение={params['meta_doubt']:.3f}, "
+                       f"любопытство={params['meta_curiosity']:.3f})")
 
         # CoT (цепочка мыслей)
         if use_chain_of_thought and self.personality_core:
@@ -5584,19 +5628,14 @@ class Thalia(GPT2LMHeadModel):
                 attention_mask = torch.ones_like(input_ids)
             # 🔥 Учитываем мета-решение для длины CoT
             cot_max_tokens = 512 if params.get('meta_decision') == 'deep_rethink' else 256
-            if params.get('meta_decision') == 'explore':
-                cot_max_tokens = 384  # средняя длина для исследования
-                
             cot_ids = self._generate_internal_thought(
                 input_ids, attention_mask,
                 temperature=params['temperature'] * params.get('cot_temperature_multiplier', 1.3),
                 top_p=params['top_p'],
                 max_new_tokens=cot_max_tokens
             )
-            if cot_ids is not None and cot_ids.shape[-1] > 0:
-                input_ids = torch.cat([input_ids, cot_ids], dim=-1)
-                attention_mask = torch.cat([attention_mask, torch.ones_like(cot_ids)], dim=-1)
-                logger.info(f"💭 CoT сгенерирована: {cot_ids.shape[-1]} токенов")
+            input_ids = torch.cat([input_ids, cot_ids], dim=-1)
+            attention_mask = torch.cat([attention_mask, torch.ones_like(cot_ids)], dim=-1)
 
         # Запоминаем состояние для RL
         prev_drives = None
@@ -5605,19 +5644,12 @@ class Thalia(GPT2LMHeadModel):
 
         # Генерация
         with torch.no_grad():
-            # 🔥 Используем динамическую длину на основе мета-решения
-            max_new_tokens_clamped = params['max_new_tokens_clamped']
-            if params.get('meta_decision') == 'deep_rethink':
-                max_new_tokens_clamped = max(512, max_new_tokens_clamped)
-            elif params.get('meta_decision') == 'explore':
-                max_new_tokens_clamped = max(384, max_new_tokens_clamped)
-            
             output = super(Thalia, self).generate(
                 inputs=input_ids,
                 attention_mask=attention_mask,
                 generation_config=GenerationConfig(
-                    max_new_tokens=max_new_tokens_clamped,
-                    min_new_tokens=params.get('min_new_tokens', 30),
+                    max_new_tokens=params['max_new_tokens_clamped'],
+                    min_new_tokens=params.get('min_new_tokens', 30),  # 🔥 минимальная длина
                     do_sample=True,
                     temperature=params['temperature'],
                     top_p=params['top_p'],
@@ -5642,14 +5674,8 @@ class Thalia(GPT2LMHeadModel):
         if generated_len < 30:
             logger.warning(f"⚠️ Короткая генерация: {generated_len} токенов. "
                           f"Мета-решение: {params.get('meta_decision', '?')}")
-            
-            # 🔥 Если генерация слишком короткая, возможно, стоит добавить fallback
-            if generated_len < 10 and params.get('meta_decision') != 'act':
-                logger.info("🔄 Короткая генерация — пробуем с повышенной температурой")
-                # Можно добавить повторную генерацию с другими параметрами
 
         # RL-обновление
-        reward = 0.0
         if record_experience and self.personality_core is not None and prev_drives is not None:
             current_drives = self.personality_core.get_drive_values().detach()
             reward = self.personality_core.calculate_intrinsic_reward(prev_drives, current_drives, user_feedback=0.5)
@@ -5660,48 +5686,12 @@ class Thalia(GPT2LMHeadModel):
                 self.personality_core.trait_raw.data.mul_(0.95)
                 lr = 0.001
             self.personality_core.apply_reinforcement(reward, learning_rate=lr)
-            
-            # 🔥 Запоминаем исход генерации для мета-обучения
-            if hasattr(self, 'adaptive_memory') and self.adaptive_memory is not None:
-                if hasattr(self.adaptive_memory, 'meta_predictor'):
-                    try:
-                        # Определяем успешность генерации
-                        was_successful = generated_len >= 50 and reward > 0.1
-                        confidence = params.get('meta_confidence', 0.5)
-                        
-                        # Сохраняем для мета-обучения
-                        self.adaptive_memory.meta_predictor.remember_outcome(
-                            batch_indices=[0],
-                            was_correct=[was_successful],
-                            state=input_ids[:, -1:],  # последний токен как состояние
-                            confidence=torch.tensor([confidence])
-                        )
-                        
-                        if was_successful:
-                            logger.info(f"✅ Успешная генерация ({generated_len} токенов) зафиксирована для мета-обучения")
-                    except Exception as e:
-                        logger.debug(f"⚠️ Ошибка мета-обучения: {e}")
-
-        # 🔥 ФИНАЛЬНОЕ ЛОГИРОВАНИЕ ПОСЛЕ ГЕНЕРАЦИИ
-        if generated_len > 0:
-            logger.info(f"✨ Генерация завершена: {generated_len} токенов | "
-                       f"Награда: {reward:.3f} | "
-                       f"Мета-решение: {params.get('meta_decision', 'act')}")
 
         metadata = {
             'gen_params': params,
-            'rl_data': {'reward': reward},
-            'generated_len': generated_len,
-            'meta_state': {
-                'decision': params.get('meta_decision', 'act'),
-                'confidence': params.get('meta_confidence', 0),
-                'doubt': params.get('meta_doubt', 0),
-                'curiosity': params.get('meta_curiosity', 0),
-                'readiness': params.get('meta_readiness', 0)
-            },
-            'prompt_injected': getattr(self, '_talia_prompt_injected', False)
+            'rl_data': {'reward': reward if 'reward' in locals() else 0.0},
+            'generated_len': generated_len
         }
-        
         return generated, metadata
  
     def _generate_internal_thought(self, input_ids, attention_mask, temperature=1.4, top_p=0.97, max_new_tokens=256):
@@ -6038,7 +6028,7 @@ class Thalia(GPT2LMHeadModel):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
         """
-        🔥 ИСПРАВЛЕННЫЙ from_pretrained с загрузкой мета-предиктора и восстановлением hooks
+        🔥 ИСПРАВЛЕННЫЙ from_pretrained с загрузкой мета-предиктора
         """
         import os
         
@@ -6201,31 +6191,6 @@ class Thalia(GPT2LMHeadModel):
                     logger.warning(f"⚠ Ошибка загрузки улучшенного состояния: {e}")
                     import traceback
                     logger.debug(traceback.format_exc())
-            
-            # ===========================================================
-            # 🔥 ВОССТАНАВЛИВАЕМ BACKWARD HOOKS ПОСЛЕ ЗАГРУЗКИ
-            # ===========================================================
-            if hasattr(model.transformer, 'wte'):
-                # 🔥 БЕЗОПАСНАЯ ОЧИСТКА: проверяем, существует ли _backward_hooks
-                if hasattr(model.transformer.wte.weight, '_backward_hooks'):
-                    if model.transformer.wte.weight._backward_hooks is not None:
-                        model.transformer.wte.weight._backward_hooks.clear()
-                # Регистрируем новый hook
-                model.transformer.wte.weight.register_hook(
-                    lambda grad: grad * 0.08
-                )
-                logger.info("🛡️ Backward hook на wte восстановлен после загрузки")
-
-            if hasattr(model.transformer, 'wpe'):
-                # 🔥 БЕЗОПАСНАЯ ОЧИСТКА: проверяем, существует ли _backward_hooks
-                if hasattr(model.transformer.wpe.weight, '_backward_hooks'):
-                    if model.transformer.wpe.weight._backward_hooks is not None:
-                        model.transformer.wpe.weight._backward_hooks.clear()
-                # Регистрируем новый hook
-                model.transformer.wpe.weight.register_hook(
-                    lambda grad: grad * 0.35
-                )
-                logger.info("🛡️ Backward hook на wpe восстановлен после загрузки")
             
             model = model.to(device)
             return model
