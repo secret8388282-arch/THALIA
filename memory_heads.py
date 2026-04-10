@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# memory_heads.py - ИСПРАВЛЕННАЯ ВЕРСИЯ v11.1 (batch fixes + persistent loss + deepcopy)
+# memory_heads.py - ИСПРАВЛЕННАЯ ВЕРСИЯ v11.2 (batch fixes + persistent loss + deepcopy)
 import threading
 import torch
 import torch.nn as nn
@@ -15,12 +15,10 @@ import copy
 from torch.utils.data import Dataset, DataLoader
 from typing import Dict, List, Optional, Tuple, Set, Any
 from collections import deque
-try:
-    import numpy as np
-except ImportError:
-    np = None
-    logger.warning("⚠ NumPy не найден, некоторые функции статистики будут ограничены")
+
+# 🔥 ИСПРАВЛЕНИЕ 1: logger ДО импорта numpy
 logger = logging.getLogger(__name__)
+
 # Пробуем импортировать быстрый JSON
 try:
     import orjson
@@ -28,6 +26,14 @@ try:
     logger.info("🚀 orjson найден — JSON будет в 10x быстрее")
 except ImportError:
     HAS_ORJSON = False
+
+# 🔥 ИСПРАВЛЕНИЕ 1: numpy после logger
+try:
+    import numpy as np
+except ImportError:
+    np = None
+    logger.warning("⚠ NumPy не найден, некоторые функции статистики будут ограничены")
+
 from memory_heads_centroid import CentroidMemoryManager
 
 # ===================================================================
@@ -57,18 +63,17 @@ class AdversarialInverterOptimized:
     def feature_lobotomy(vector, suppression_k=7, boost_k=5, inversion_strength=1.5, boost_ratio=0.2):
         """
         🧠 ВЕКТОРИЗОВАННАЯ Batch-safe Lobotomy - БЕЗ ЦИКЛОВ
+        🔥 ИСПРАВЛЕНИЕ 11: упрощено избыточное условие
         """
         clone = vector.clone()
        
-        # Убеждаемся что работаем с правильной размерностью
         was_1d = clone.dim() == 1
         if was_1d:
-            clone = clone.unsqueeze(0) # [D] → [1, D]
+            clone = clone.unsqueeze(0)
        
         abs_v = clone.abs()
         B, D = clone.shape
        
-        # Ограничиваем k размерностью
         suppression_k = min(suppression_k, D // 4)
         boost_k = min(boost_k, D // 4)
        
@@ -82,7 +87,7 @@ class AdversarialInverterOptimized:
         top_vals_gathered = clone.gather(-1, top_indices)
         clone.scatter_(-1, top_indices, -top_vals_gathered * inversion_strength)
        
-        # 3. ПЕРЕМЕШИВАНИЕ - ВЕКТОРИЗОВАННОЕ (без цикла!)
+        # 3. ПЕРЕМЕШИВАНИЕ - ВЕКТОРИЗОВАННОЕ
         mid_k = min(suppression_k * 2, D)
         if mid_k > suppression_k:
             _, mid_indices = torch.topk(abs_v, k=mid_k, dim=-1)
@@ -90,8 +95,6 @@ class AdversarialInverterOptimized:
            
             if mid_indices.numel() > 0:
                 mid_vals = clone.gather(-1, mid_indices)
-                # 🔥 ВЕКТОРИЗОВАННОЕ ПЕРЕМЕШИВАНИЕ
-                # Создаем случайные перестановки для каждого элемента батча
                 batch_perm = torch.argsort(torch.rand(B, mid_vals.size(-1), device=vector.device), dim=-1)
                 mid_vals_shuffled = mid_vals.gather(-1, batch_perm)
                 clone.scatter_(-1, mid_indices, mid_vals_shuffled)
@@ -103,7 +106,8 @@ class AdversarialInverterOptimized:
             clone.scatter_(-1, bottom_indices, noise)
        
         # 5. НОРМАЛИЗАЦИЯ
-        original_norm = vector.norm(dim=-1, keepdim=True) if was_1d else vector.norm(dim=-1, keepdim=True)
+        # 🔥 ИСПРАВЛЕНИЕ 11: упрощённое условие
+        original_norm = vector.norm(dim=-1, keepdim=True)
         result = F.normalize(clone, p=2, dim=-1) * original_norm
        
         if was_1d:
@@ -188,8 +192,20 @@ class AdversarialInverterOptimized:
     def logical_twist(vector, complexity=0.2):
         """
         🌪 Метод 'Логический вывих' - векторизованная версия
+        🔥 ИСПРАВЛЕНИЕ 5: поддержка 1D векторов
         """
+        was_1d = vector.dim() == 1
+        if was_1d:
+            vector = vector.unsqueeze(0)
+        
         B, D = vector.shape
+        
+        # Защита от слишком маленькой размерности
+        if D < 4:
+            if was_1d:
+                return vector.squeeze(0)
+            return vector
+        
         # Разбиваем вектор на 4 части
         chunk_size = D // 4
         chunks = []
@@ -197,27 +213,41 @@ class AdversarialInverterOptimized:
             start = i * chunk_size
             end = (i + 1) * chunk_size if i < 3 else D
             chunks.append(vector[..., start:end])
-       
+        
         # Векторизованное перемешивание для всего батча
         if len(chunks) >= 4:
-            # Создаем тензор [B, 4, chunk_size]
-            stacked = torch.stack(chunks, dim=1)
-           
+            # Выравниваем размеры чанков для batch-операций
+            max_chunk_size = max(c.shape[-1] for c in chunks)
+            padded_chunks = []
+            for c in chunks:
+                if c.shape[-1] < max_chunk_size:
+                    padding = torch.zeros(*c.shape[:-1], max_chunk_size - c.shape[-1], device=c.device, dtype=c.dtype)
+                    c = torch.cat([c, padding], dim=-1)
+                padded_chunks.append(c)
+            
+            # Создаем тензор [B, 4, max_chunk_size]
+            stacked = torch.stack(padded_chunks, dim=1)
+            
             # Случайные перестановки для каждого элемента батча
             batch_perm = torch.argsort(torch.rand(B, 4, device=vector.device), dim=-1)
-           
+            
             # Применяем перестановки ко всему батчу
-            perm_indices = batch_perm.unsqueeze(-1).expand(-1, -1, chunk_size)
+            perm_indices = batch_perm.unsqueeze(-1).expand(-1, -1, max_chunk_size)
             twisted_stacked = torch.gather(stacked, 1, perm_indices)
-           
-            # Собираем обратно
-            twisted = twisted_stacked.view(B, D)
+            
+            # Собираем обратно и обрезаем до исходной длины
+            twisted = twisted_stacked.view(B, -1)[:, :D]
         else:
             # Для маленьких размерностей
             twisted = torch.cat(chunks, dim=-1)
-       
+        
         # Смешиваем оригинал и twist
-        return torch.lerp(vector, twisted, complexity)
+        result = torch.lerp(vector, twisted, complexity)
+        
+        if was_1d:
+            result = result.squeeze(0)
+        
+        return result
    
     @staticmethod
     def create_gaslight_trap(positive_vector, original_thought=None):
@@ -613,6 +643,9 @@ class ThaliaMambaHead(nn.Module):
         """
         🔥 ИСПРАВЛЕННАЯ БЕЗОПАСНАЯ ВЕРСИЯ: RNN цикл вместо cumprod.
         Устраняет взрыв градиентов (NaNs) при backward pass!
+        
+        🔥 Этот метод использует последовательную RNN (не векторизованную по времени),
+        но векторизован по батчу. Название "mimo" относится к batch-векторизации.
         """
         batch_size, chunk_len, inner_dim = x_chunk.shape
         state_dim = A.shape[-1]
@@ -621,21 +654,17 @@ class ThaliaMambaHead(nn.Module):
         ys = []
        
         for t in range(chunk_len):
-            # Извлекаем данные для текущего шага
             dt_t = dt_chunk[:, t, :].unsqueeze(-1)  # [batch, inner_dim, 1]
             A_t = A.unsqueeze(0)                    # [1, inner_dim, state_dim]
             
-            # Коэффициенты перехода
             dA_t = torch.exp(dt_t * A_t)            # [batch, inner_dim, state_dim]
            
             B_t = B_chunk[:, t, :].unsqueeze(1)     # [batch, 1, state_dim]
             x_t = x_chunk[:, t, :].unsqueeze(-1)    # [batch, inner_dim, 1]
             dB_t = dt_t * B_t * x_t                 # [batch, inner_dim, state_dim]
            
-            # Обновляем скрытое состояние
             h = dA_t * h + dB_t
            
-            # Вычисляем выход
             C_t = C_chunk[:, t, :].unsqueeze(1)     # [batch, 1, state_dim]
             y_t = (h * C_t).sum(dim=-1)             # [batch, inner_dim]
             ys.append(y_t)
@@ -645,7 +674,6 @@ class ThaliaMambaHead(nn.Module):
         if hasattr(self, 'D'):
             y = y + self.D.unsqueeze(0).unsqueeze(0) * x_chunk
            
-        # Защита от NaN на выходе
         y = torch.nan_to_num(y, nan=0.0, posinf=1.0, neginf=-1.0)
         
         return y, h
@@ -942,15 +970,17 @@ class StabilizedContrastiveLoss(nn.Module):
         super().__init__()
         self.base_margin = base_margin
         self.alpha = alpha
-        self.max_diff = max_diff # 🔥 Снижен с 1.0 до 0.8
-       
+        self.max_diff = max_diff  # 🔥 Снижен с 1.0 до 0.8
+        
         # 🔥 ИСПРАВЛЕНИЕ 2: Регистрируем _current_margin как буфер для персистентности
         self.register_buffer('_current_margin', torch.tensor(base_margin))
-       
-        self.growth = growth # 🔥 Снижен с 1.05 до 1.03
+        
+        self.growth = growth  # 🔥 Снижен с 1.05 до 1.03
         self.temperature = temperature
-        self._stuck_counter = 0
-       
+        
+        # 🔥 ИСПРАВЛЕНИЕ 12: регистрируем _stuck_counter как буфер
+        self.register_buffer('_stuck_counter', torch.tensor(0))
+        
     def get_vector_similarity_score(self, generated, target):
         gen_norm = F.normalize(generated, dim=-1)
         target_norm = F.normalize(target, dim=-1)
@@ -960,54 +990,54 @@ class StabilizedContrastiveLoss(nn.Module):
     def forward(self, good_output, good_target, bad_output, bad_target, include_reconstruction=True):
         good_scores = self.get_vector_similarity_score(good_output, good_target)
         bad_scores = self.get_vector_similarity_score(bad_output, bad_target)
-       
+        
         good_scores_scaled = good_scores / self.temperature
         bad_scores_scaled = bad_scores / self.temperature
-       
+        
         score_diff = good_scores - bad_scores
-       
+        
         # 🔥 УЛУЧШЕННАЯ АДАПТАЦИЯ MARGIN
         mean_diff = score_diff.mean().item()
         current_margin = self._current_margin.item()
-       
-        if mean_diff > current_margin * 1.1: # Превышаем margin на 10%+
+        
+        if mean_diff > current_margin * 1.1:  # Превышаем margin на 10%+
             # Медленно растем
             new_margin = min(self.max_diff, current_margin * self.growth)
             self._current_margin.fill_(new_margin)
-            self._stuck_counter = 0
-        elif mean_diff < current_margin * 0.8: # Ниже 80% от margin
+            self._stuck_counter.fill_(0)
+        elif mean_diff < current_margin * 0.8:  # Ниже 80% от margin
             # 🔥 БЫСТРЕЕ падаем при неудаче
-            new_margin = max(self.base_margin, current_margin * 0.97) # Было 0.995
+            new_margin = max(self.base_margin, current_margin * 0.97)  # Было 0.995
             self._current_margin.fill_(new_margin)
-            self._stuck_counter += 1
+            self._stuck_counter.add_(1)  # 🔥 используем add_ для буфера
         else:
             # В зоне комфорта - держим стабильно
-            self._stuck_counter = 0
-       
+            self._stuck_counter.fill_(0)
+        
         # 🔥 Если застряли - принудительно сбрасываем
-        if self._stuck_counter >= 10:
+        if self._stuck_counter.item() >= 10:
             self._current_margin.fill_(self.base_margin)
-            self._stuck_counter = 0
-       
+            self._stuck_counter.fill_(0)
+        
         target_margin = self._current_margin.item()
-       
+        
         # Контрастный лосс
         loss_contrast = F.relu(target_margin - score_diff).mean()
-       
+        
         total_loss = loss_contrast
-       
+        
         loss_reconstruction = torch.tensor(0.0, device=good_output.device)
         if include_reconstruction:
             loss_reconstruction = F.mse_loss(good_output, good_target) * 0.1
-       
+        
         total_loss = total_loss + loss_reconstruction
-       
+        
         # Curiosity loss
         good_probs = F.softmax(torch.stack([good_scores_scaled, bad_scores_scaled]), dim=0)[0]
         good_probs = torch.clamp(good_probs, min=1e-7, max=1.0-1e-7)
         curiosity_loss = -torch.log(good_probs).mean() * 0.1
         total_loss = total_loss + curiosity_loss
-       
+        
         stats = {
             'loss_total': total_loss.item(),
             'loss_contrast': loss_contrast.item(),
@@ -1018,9 +1048,9 @@ class StabilizedContrastiveLoss(nn.Module):
             'bad_sim': bad_scores.mean().item(),
             'margin': target_margin,
             'current_margin': target_margin,
-            'stuck_counter': self._stuck_counter
+            'stuck_counter': self._stuck_counter.item()
         }
-       
+        
         return total_loss, stats
         
 # ===================================================================
@@ -1105,43 +1135,57 @@ class MetaCognitivePredictor(nn.Module):
             self.meta_network[-1].weight.fill_(0.03)
             self.meta_network[-1].bias.fill_(0.1)
             
-    def forward(self, current_state, context=None, temperature=None, return_meta=True):
+    def forward(self, current_state, context=None, temperature=None, return_meta=True, step_count=0):
         batch_size = current_state.shape[0]
         if batch_size > self.max_batch:
             logger.warning(f"Batch {batch_size} > max_batch {self.max_batch} → обрезаем")
             current_state = current_state[:self.max_batch]
             if context is not None:
                 context = context[:self.max_batch]
+        
         device = current_state.device
         predicted = self.predictor(current_state)
+        
         # Мета-вход
         if context is not None:
             meta_input = torch.cat([current_state, context], dim=-1)
         else:
             meta_input = torch.cat([current_state, current_state - predicted], dim=-1)
+        
         temp = temperature if temperature is not None else torch.clamp(
-            self._base_temperature * (1.0 + self.temperature_adaptation * self._compute_novelty(current_state).mean()), 0.5, 2.0
+            self._base_temperature * (1.0 + self.temperature_adaptation * self._compute_novelty(current_state).mean()), 
+            0.5, 2.0
         )
+        
         meta_logits = self.meta_network(meta_input)
         meta_probs = torch.sigmoid(meta_logits / temp)
+        
         confidence = meta_probs[..., 0]
         doubt = meta_probs[..., 1]
         curiosity = meta_probs[..., 2]
         readiness = meta_probs[..., 3]
         need_recheck = meta_probs[..., 4]
-        # Память + новизна
-        sim_error = self._check_similar_to_errors_weighted(current_state)
-        sim_success = self._check_similar_to_success_weighted(current_state)
+        
+        # ===========================================================
+        # 🔥 ИСПРАВЛЕНИЕ 3: передаём step_count
+        # ===========================================================
+        sim_error = self._check_similar_to_errors_weighted(current_state, step_count=step_count)
+        sim_success = self._check_similar_to_success_weighted(current_state, step_count=step_count)
+        
         novelty = 1.0 - sim_success
+        
         # 🔥 ИСПРАВЛЕННОЕ любопытство + сомнение
-        curiosity = curiosity * 0.82 + novelty * 0.18 # чуть сильнее затухание
-        curiosity = torch.clamp(curiosity, 0.0, 0.92) # потолок ниже
+        curiosity = curiosity * 0.82 + novelty * 0.18  # чуть сильнее затухание
+        curiosity = torch.clamp(curiosity, 0.0, 0.92)  # потолок ниже
+        
         # Самокритика теперь сильнее влияет на doubt
         self_doubt = self.critic(torch.cat([current_state, predicted], dim=-1)).squeeze(-1)
-        doubt = torch.clamp(doubt + self_doubt * 0.45, 0.05, 1.0) # минимум 0.05 + сильнее
+        doubt = torch.clamp(doubt + self_doubt * 0.45, 0.05, 1.0)  # минимум 0.05 + сильнее
+        
         # 🔥 Убираем агрессивное подавление doubt
         # confidence = confidence * (1.0 - doubt * 0.7) ← УДАЛИТЬ ЭТУ СТРОКУ!
-        confidence = torch.clamp(confidence, 0.1, 0.95) # просто ограничиваем
+        confidence = torch.clamp(confidence, 0.1, 0.95)  # просто ограничиваем
+        
         # === ОБУЧЕНИЕ (target_doubt стал честнее) ===
         meta_loss = torch.tensor(0.0, device=device)
         if self.training:
@@ -1152,24 +1196,32 @@ class MetaCognitivePredictor(nn.Module):
             target_curiosity = torch.clamp(novelty * 0.85, 0.0, 0.92)
             target_readiness = 1.0 - target_conf
             target_recheck = torch.clamp(doubt * 1.3, 0.1, 1.0)
+            
             loss_conf = F.mse_loss(confidence, target_conf)
             loss_doubt = F.mse_loss(doubt, target_doubt)
             loss_cur = F.mse_loss(curiosity, target_curiosity)
             loss_ready = F.mse_loss(readiness, target_readiness)
             loss_recheck = F.mse_loss(need_recheck, target_recheck)
+            
             adaptation_speed = 0.05 + (1.0 - self._learning_momentum.mean()) * 0.15
+            
             reg = torch.tensor(0.0, device=device)
             if confidence.numel() > 1:
                 var = (torch.var(confidence) + torch.var(doubt) + torch.var(curiosity)) / 3
                 reg = -self.diversity_coef * var
                 reg = torch.clamp(reg, -0.1, 0.1)
+            
             meta_loss = (loss_conf + loss_doubt + loss_cur + loss_ready + loss_recheck) * adaptation_speed + reg
             meta_loss = torch.clamp(meta_loss, 0.0, 2.0)
+        
         decision = self._make_decision(confidence, doubt, need_recheck, curiosity)
+        
+        # ===========================================================
         # 🔥 ИСПРАВЛЕНИЕ: теперь doubt всегда сохраняется корректно
+        # ===========================================================
         self._last_meta = {
             "confidence": confidence,
-            "doubt": doubt, # ← вот это было потеряно
+            "doubt": doubt,  # ← вот это было потеряно
             "curiosity": curiosity,
             "readiness": readiness,
             "need_recheck": need_recheck,
@@ -1177,8 +1229,10 @@ class MetaCognitivePredictor(nn.Module):
             "novelty": novelty,
             "decision": decision,
             "meta_loss": meta_loss,
-            "temperature": temp.item() if isinstance(temp, torch.Tensor) else temp
+            "temperature": temp.item() if isinstance(temp, torch.Tensor) else temp,
+            "step_count": step_count  # ← добавляем для отладки
         }
+        
         if return_meta:
             return predicted, self._last_meta
         return predicted
@@ -1246,8 +1300,8 @@ class MetaCognitivePredictor(nn.Module):
             "improved": confidence_after > confidence_before
         }
         
-    def _check_similar_to_errors_weighted(self, current_state):
-        """🔥 ИСПРАВЛЕНО: безопасное сравнение размерностей"""
+    def _check_similar_to_errors_weighted(self, current_state, step_count=0):
+        """🔥 ИСПРАВЛЕНО: безопасное сравнение размерностей + step_count параметр"""
         batch_size = current_state.shape[0]
         similarities = torch.zeros(batch_size, device=current_state.device)
        
@@ -1256,28 +1310,29 @@ class MetaCognitivePredictor(nn.Module):
             if ptr == 0:
                 continue
            
-            errors = self._error_memory[b, :ptr] # [ptr, slot_dim]
+            errors = self._error_memory[b, :ptr]  # [ptr, slot_dim]
             if errors.shape[0] == 0:
                 continue
            
             # 🔥 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: проверяем размерность
-            current = current_state[b:b+1] # [1, slot_dim]
+            current = current_state[b:b+1]  # [1, slot_dim]
            
             # Если размерности не совпадают — пропускаем
             if current.shape[-1] != errors.shape[-1]:
-                if self.step_count % 100 == 0:
+                # 🔥 ИСПРАВЛЕНИЕ 3: используем переданный step_count
+                if step_count % 100 == 0:
                     logger.warning(f"⚠ Размерности не совпадают: current={current.shape[-1]}, errors={errors.shape[-1]}")
                 continue
            
             weights = self._recency_weights[:ptr].to(current_state.device)
             weights = weights / weights.sum()
            
-            sims = F.cosine_similarity(current, errors, dim=-1) # [ptr]
+            sims = F.cosine_similarity(current, errors, dim=-1)  # [ptr]
             similarities[b] = (sims * weights).sum()
        
         return similarities
-   
-    def _check_similar_to_success_weighted(self, current_state):
+
+    def _check_similar_to_success_weighted(self, current_state, step_count=0):
         """🔥 ИСПРАВЛЕНО: безопасное сравнение размерностей"""
         batch_size = current_state.shape[0]
         similarities = torch.zeros(batch_size, device=current_state.device)
@@ -1293,9 +1348,8 @@ class MetaCognitivePredictor(nn.Module):
            
             current = current_state[b:b+1]
            
-            # 🔥 ПРОВЕРКА РАЗМЕРНОСТИ
             if current.shape[-1] != successes.shape[-1]:
-                if self.step_count % 100 == 0:
+                if step_count % 100 == 0:
                     logger.warning(f"⚠ Размерности не совпадают: current={current.shape[-1]}, successes={successes.shape[-1]}")
                 continue
            
@@ -1552,6 +1606,7 @@ class AdaptiveMemoryHeads(nn.Module):
        
         # Запись в блокнот и обучение
         self.writer_insight_threshold = getattr(config, 'writer_insight_threshold', 0.42)
+        
         # 🔥 Curriculum для recovery
         self.recovery_level = 0 # 0-3
         self.recovery_success_streak = 0
@@ -1702,7 +1757,9 @@ class AdaptiveMemoryHeads(nn.Module):
             if isinstance(layer, nn.Linear):
                 nn.init.xavier_uniform_(layer.weight, gain=0.3)
                 nn.init.zeros_(layer.bias)
-
+                
+        self._predictor_loss = None
+        
         #── НОВЫЙ ИЗЯЩНЫЙ MEMORY GATE v2.0 ───────────────────────────────
         self.memory_gate_logit = nn.Parameter(torch.tensor(-0.8))   # старт ≈ 0.31
 
@@ -2658,9 +2715,24 @@ class AdaptiveMemoryHeads(nn.Module):
                     logger.info(f"📉 Мета-loss в результате: {result['meta_loss'].item():.6f}")
                
                 # 🔥 Логируем состояние memory gate (теперь динамический)
-                if 'gate_aux_loss' in result and result['gate_aux_loss'].item() > 0:
-                    logger.info(f"🚪 Memory gate aux loss: {result['gate_aux_loss'].item():.6f}")
+                #if 'gate_aux_loss' in result and result['gate_aux_loss'].item() > 0:
+                    #logger.info(f"🚪 Memory gate aux loss: {result['gate_aux_loss'].item():.6f}")
            
+            # 🔥 КОНТРАБАНДА ГРАДИЕНТОВ ПРЕДИКТОРА
+            if hasattr(self, '_predictor_loss') and self._predictor_loss is not None:
+                if 'gate_aux_loss' in result and isinstance(result['gate_aux_loss'], torch.Tensor):
+                    result['gate_aux_loss'] = result['gate_aux_loss'] + self._predictor_loss
+                else:
+                    result['gate_aux_loss'] = self._predictor_loss
+                self._predictor_loss = None
+                
+                if self.step_count % 50 == 0:
+                    logger.debug(f"📊 Predictor loss добавлен в gate_aux_loss")
+            
+            # 🔥 Логируем состояние memory gate
+            #if 'gate_aux_loss' in result and result['gate_aux_loss'].item() > 0:
+                #logger.info(f"🚪 Memory gate aux loss: {result['gate_aux_loss'].item():.6f}")
+            
             return result
             
 # ===================================================================
@@ -3557,11 +3629,15 @@ class AdaptiveMemoryHeads(nn.Module):
                 test_thought = random.choice(positive_thoughts)
                 original_vector = torch.tensor(test_thought['snapshot'], dtype=torch.float32, device=device)
                 original_vector = F.normalize(original_vector, dim=-1)
-               
+                
+                # ===========================================================
+                # 🔥 ИСПРАВЛЕНИЕ 6: правильная структура с else для каждого уровня
+                # ===========================================================
                 if self.recovery_level == 0:
                     noise_strength = random.uniform(0.05, 0.1)
                     corrupted_vector = original_vector + torch.randn_like(original_vector) * noise_strength
                     corruption_method = "light_noise"
+                    
                 elif self.recovery_level == 1:
                     noise_strength = random.uniform(0.15, 0.25)
                     corrupted_vector = original_vector + torch.randn_like(original_vector) * noise_strength
@@ -3573,6 +3649,7 @@ class AdaptiveMemoryHeads(nn.Module):
                         random.shuffle(chunks[:2])
                         corrupted_vector = torch.cat(chunks, dim=-1)
                         corruption_method += "+twist"
+                        
                 elif self.recovery_level == 2:
                     hard_negatives = [t for t in self.data_manager.get_thoughts_slice()
                                     if t.get('type') == 'hard_negative']
@@ -3581,9 +3658,11 @@ class AdaptiveMemoryHeads(nn.Module):
                         corrupted_vector = torch.tensor(hn_thought['snapshot'], dtype=torch.float32, device=device)
                         corruption_method = f"hard_negative_{hn_thought.get('method', 'unknown')}"
                     else:
+                        # 🔥 ИСПРАВЛЕНИЕ 6: корректный else внутри уровня
                         corrupted_vector = original_vector + torch.randn_like(original_vector) * 0.3
                         corruption_method = "strong_noise_fallback"
-                else: # level 3
+                        
+                else:  # level >= 3
                     complex_neg = [t for t in self.data_manager.get_thoughts_slice()
                                  if t.get('type') in ['hard_negative', 'gaslight_trap']
                                  and t.get('similarity_to_original', -0.5) < -0.5]
@@ -3594,11 +3673,11 @@ class AdaptiveMemoryHeads(nn.Module):
                     else:
                         corrupted_vector = -original_vector * random.uniform(0.7, 0.9)
                         corruption_method = "inversion"
-               
+                
                 corrupted_vector = F.normalize(corrupted_vector, dim=-1)
-               
+                
                 before_sim = F.cosine_similarity(corrupted_vector.unsqueeze(0), original_vector.unsqueeze(0)).item()
-               
+                
                 with torch.no_grad():
                     corrupted_input = corrupted_vector.unsqueeze(0).unsqueeze(1)
                     restored_output, _, _ = self.mamba_writer(
@@ -3611,20 +3690,20 @@ class AdaptiveMemoryHeads(nn.Module):
                        
                     restored_vector = restored_output[:, -1, :].squeeze(0)
                     restored_vector = F.normalize(restored_vector, dim=-1)
-               
+                
                 after_sim = F.cosine_similarity(restored_vector.unsqueeze(0), original_vector.unsqueeze(0)).item()
                 improvement = max(0.0, after_sim - before_sim) * (1.0 + self.recovery_level * 0.4)
                 recon_improvements.append(improvement)
-               
+                
                 if improvement > 0.1:
                     successes += 1
-               
+                
                 if improvement > 0.2 and after_sim > 0.7:
                     evolved_thought = test_thought.copy()
-                   
+                    
                     evolved_delta = min(1.0, test_thought.get('delta', 0.5) * 1.2)
                     evolved_reward = min(0.95, test_thought.get('reward', 0.5) + 0.15)
-                   
+                    
                     evolved_thought.update({
                         "step": self.step_count,
                         "type": "evolved_insight",
@@ -3642,13 +3721,13 @@ class AdaptiveMemoryHeads(nn.Module):
                         "max_age": self.max_age_positive,
                         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     })
-                   
+                    
                     evolved_count = sum(1 for t in self.data_manager.thought_chains
                                       if t.get('type') == 'evolved_insight')
                     if evolved_count < 10:
                         self.data_manager.add_thought_chain(evolved_thought)
                         evolved_thoughts += 1
-                       
+                        
                         self.recovered_thoughts_history.append({
                             'step': self.step_count,
                             'improvement': improvement,
@@ -3657,7 +3736,7 @@ class AdaptiveMemoryHeads(nn.Module):
                         })
                         if len(self.recovered_thoughts_history) > self.max_recovered_thoughts:
                             self.recovered_thoughts_history.pop(0)
-                   
+                       
             except Exception as e:
                 continue
        
@@ -3916,16 +3995,37 @@ class AdaptiveMemoryHeads(nn.Module):
             if insight_final is not None:
                 try:
                     was_training = self.predictor.training
-                    self.predictor.eval()
-                   
-                    with torch.no_grad():
-                        pred_input = insight_final.unsqueeze(0)
+                    
+                    # ===========================================================
+                    # 🔥 УЧИМ ПРЕДИКТОР В ПРОЦЕССЕ WRITER
+                    # ===========================================================
+                    if was_training:
+                        self.predictor.train()
+                        # ОТРЫВАЕМ ВХОД от градиентов Mamba
+                        pred_input = insight_final.unsqueeze(0).detach()
                         predicted = self.predictor(pred_input).squeeze(0)
                         predicted = F.normalize(predicted, dim=-1)
-                   
-                    metrics = self.curiosity.compute(predicted, insight_final)
-                   
-                    # 🔥 ИЗВЛЕКАЕМ SURPRISE
+                        
+                        # Считаем метрики (detach обязателен)
+                        metrics = self.curiosity.compute(predicted.detach(), insight_final.detach())
+                        
+                        # 🔥 СОХРАНЯЕМ LOSS ПРЕДИКТОРА
+                        self._predictor_loss = F.mse_loss(predicted, insight_final.detach()) * 0.5
+                        
+                        # 🔥 ДОПОЛНИТЕЛЬНО: обновляем предсказание с градиентами
+                        if hasattr(self, '_last_prediction'):
+                            self._last_prediction = predicted.detach()
+                    else:
+                        self.predictor.eval()
+                        with torch.no_grad():
+                            pred_input = insight_final.unsqueeze(0)
+                            predicted = self.predictor(pred_input).squeeze(0)
+                            predicted = F.normalize(predicted, dim=-1)
+                        metrics = self.curiosity.compute(predicted, insight_final)
+                    
+                    # ===========================================================
+                    # 🔥 ИЗВЛЕКАЕМ SURPRISE И ДРУГИЕ МЕТРИКИ
+                    # ===========================================================
                     surprise = metrics["surprise"]
                     state = metrics["state"]
                     motivation = metrics["motivation"] * mood_factor
@@ -4365,28 +4465,38 @@ class AdaptiveMemoryHeads(nn.Module):
     def _should_record_thought(self, state, effective_delta, effective_surprise,
                               effective_threshold, adaptive_threshold,
                               bored_condition, force_record):
+        """🔥 ИСПРАВЛЕНИЕ 7: улучшенная логика записи мыслей"""
         if state in ["overloaded", "shocked"]:
             return False
-       
-        if effective_delta < effective_threshold * 0.72:
-            return False
-       
+        
         reasons = []
+        
+        # Проверяем delta (основной критерий)
+        if effective_delta >= effective_threshold * 0.72:
+            reasons.append("delta_good")
+        else:
+            # Если delta низкий - не записываем
+            return False
+        
+        # Проверяем surprise (вторичный критерий)
         if effective_surprise > adaptive_threshold * 0.6:
             reasons.append("surprise")
-        if effective_delta > self._calculate_adaptive_threshold_smooth():
-            reasons.append("delta_high")
+        elif effective_delta >= effective_threshold * 1.2:
+            # Высокий delta может компенсировать низкий surprise
+            reasons.append("delta_high_compensation")
+        
+        # Дополнительные условия
         if state == "engaged":
             reasons.append("engaged")
         if bored_condition:
             reasons.append("bored")
         if force_record:
             reasons.append("forced")
-       
+        
         if reasons:
-            logger.debug(f"📝 Запись мысли: {', '.join(reasons)}")
+            logger.debug(f"📝 Запись мысли: {', '.join(reasons)} (Δ={effective_delta:.3f}, 🤯={effective_surprise:.3f})")
             return True
-       
+        
         return False
         
 # ===================================================================
@@ -4395,32 +4505,34 @@ class AdaptiveMemoryHeads(nn.Module):
     def _generate_hard_negative(self, positive_thought, preferred_method=None):
         """⚔️ Генерирует сложный негатив с учетом текущего баланса блокнота"""
         thoughts = self.data_manager.get_thoughts_slice()
-       
+        
         hard_negative_count = sum(1 for t in thoughts if t.get('type') == 'hard_negative')
         gaslight_count = sum(1 for t in thoughts if t.get('is_gaslight', False))
         total_hard = hard_negative_count + gaslight_count
-       
+        
+        # Вычисление вероятностей
         base_probability = getattr(self, 'hard_negative_probability', 0.9)
         adaptive_probability = base_probability
-       
+        
         if len(thoughts) > 50:
             current_hard_ratio = total_hard / len(thoughts)
-           
+            
             if current_hard_ratio > 0.4:
                 reduction_factor = 0.4 / current_hard_ratio
                 adaptive_probability = base_probability * reduction_factor
                 adaptive_probability = max(0.3, min(0.95, adaptive_probability))
-               
+                
                 if self.step_count % 50 == 0:
                     logger.debug(f"⚖️ Баланс Hard: {total_hard}/{len(thoughts)}={current_hard_ratio:.2f} → prob={adaptive_probability:.3f}")
-           
+            
             elif current_hard_ratio < 0.2:
                 boost_factor = 1.0 + (0.2 - current_hard_ratio)
                 adaptive_probability = base_probability * boost_factor
                 adaptive_probability = min(0.99, adaptive_probability)
-       
+        
+        # Gaslight проверка
         gaslight_probability = getattr(self, 'gaslight_prob', 0.1)
-       
+        
         if gaslight_count / max(1, len(thoughts)) > 0.15:
             should_gaslight = False
             if self.step_count % 50 == 0:
@@ -4432,12 +4544,12 @@ class AdaptiveMemoryHeads(nn.Module):
                 positive_thought.get('delta', 0) > 0.75 and
                 positive_thought.get('type') == 'curiosity_insight'
             )
-       
+        
         if should_gaslight:
             try:
                 positive_vector = torch.tensor(positive_thought['snapshot'], dtype=torch.float32)
                 positive_vector = F.normalize(positive_vector, dim=-1)
-               
+                
                 if random.random() < 0.6:
                     gaslight_vector, gaslight_thought = AdversarialInverterOptimized.create_gaslight_trap(
                         positive_vector, positive_thought
@@ -4449,66 +4561,66 @@ class AdaptiveMemoryHeads(nn.Module):
                         positive_vector, positive_thought, corruption_strength
                     )
                     method = "subtle_gaslight"
-               
+                
                 gaslight_thought['method'] = method
                 gaslight_thought['is_gaslight'] = True
-               
+                
                 if self.step_count % 50 == 0:
                     logger.info(f"🔥 GASLIGHT TRAP ({method}): "
                                f"Δ={positive_thought.get('delta', 0):.1f}→{gaslight_thought.get('delta', 0):.1f}")
-               
+                
                 return gaslight_thought
-               
+                
             except Exception as e:
                 logger.warning(f"⚠ Ошибка генерации Gaslight Trap: {e}")
-       
+        
         if positive_thought.get('delta', 0) < 0.3:
             return None
-       
+        
         if random.random() > adaptive_probability:
             if self.step_count % 100 == 0:
                 logger.debug(f"⚖️ Пропускаем Hard Negative по вероятности: {adaptive_probability:.3f}")
             return None
-       
-        available_methods = ['lobotomy', 'twist', 'chimera']
-       
-        thoughts = self.data_manager.get_thoughts_slice()
+        
+        # ===========================================================
+        # 🔥  правильное определение available_methods
+        # ===========================================================
+        available_methods = ['lobotomy', 'twist']
+        
         other_positives = [t for t in thoughts
                           if t.get('snapshot') is not None
                           and t.get('step', -1) != positive_thought.get('step', -1)]
-       
+        
         if len(other_positives) >= 1:
             available_methods.append('chimera')
-        else:
-            available_methods.append('chimera')
-       
-        logger.debug(f"🔧 Доступные методы HN: {available_methods} (всего мыслей: {len(thoughts)})")
-       
+        
         if not available_methods:
+            logger.debug("⚠ Нет доступных методов для генерации Hard Negative")
             return None
-       
+        
+        # Выбор метода
         hard_negatives = [t for t in thoughts if t.get('type') == 'hard_negative']
-       
+        
         if len(hard_negatives) > 10:
             existing_methods = {}
             for t in hard_negatives[-30:]:
                 method = t.get('method', 'unknown')
                 existing_methods[method] = existing_methods.get(method, 0) + 1
-           
+            
             total_existing = sum(existing_methods.values())
-           
+            
             method_weights = {}
             for method in available_methods:
                 count = existing_methods.get(method, 0)
                 frequency = count / max(1, total_existing)
-               
+                
                 if method == 'lobotomy' and frequency < 0.2:
                     method_weights[method] = 2.0
                 elif method == 'chimera' and frequency < 0.25:
                     method_weights[method] = 1.7
                 else:
                     method_weights[method] = 1.5 - (frequency * 0.8)
-           
+            
             total_weight = sum(method_weights.values())
             if total_weight > 0:
                 r = random.random() * total_weight
@@ -4519,27 +4631,24 @@ class AdaptiveMemoryHeads(nn.Module):
                     if r <= cumulative:
                         selected_method = method
                         break
-               
+                
                 if self.step_count % 50 == 0:
                     logger.debug(f"🎲 Выбран метод: {selected_method} (веса: {method_weights})")
             else:
                 selected_method = random.choice(available_methods)
         else:
             selected_method = random.choice(available_methods)
-       
+        
         if preferred_method and preferred_method in available_methods:
             method = preferred_method
             logger.debug(f"🎯 Используем предпочтительный метод: {method}")
         else:
             method = selected_method
-       
-        if method == 'lobotomy' and self.step_count % 30 == 0:
-            logger.debug(f"🧠 Генерация LOBOTOMY для мысли с Δ={positive_thought.get('delta', 0):.3f}")
-       
+        
         try:
             positive_vector = torch.tensor(positive_thought['snapshot'], dtype=torch.float32)
             positive_vector = F.normalize(positive_vector, dim=-1)
-           
+            
             if method == 'chimera':
                 if len(other_positives) >= 1:
                     other_thought = random.choice(other_positives)
@@ -4551,192 +4660,103 @@ class AdaptiveMemoryHeads(nn.Module):
                         other_vector = -positive_vector * 0.5
                 else:
                     other_vector = -positive_vector * 0.5
-               
+                
                 intensity = 0.15 + random.random() * 0.25
                 negative_vector = AdversarialInverterOptimized.create_chimera(
                     positive_vector, other_vector, intensity=intensity
                 )
-               
+                
             elif method == 'lobotomy':
                 original_delta = positive_thought.get('delta', 0.5)
-               
+                
                 lobotomy_history = [t for t in self.data_manager.get_thoughts_slice()
                                   if t.get('method') == 'lobotomy']
-               
+                
                 if len(lobotomy_history) > 10:
                     recent_similarities = [t.get('similarity_to_original', 0)
                                           for t in lobotomy_history[-10:]]
                     avg_recent_sim = np.mean(recent_similarities)
-                   
+                    
                     if avg_recent_sim > -0.2:
                         original_delta = min(1.0, original_delta * 1.1)
                         logger.debug(f"🧠 Увеличиваем сложность lobotomy (средняя схожесть={avg_recent_sim:.3f})")
                     elif avg_recent_sim < -0.7:
                         original_delta = max(0.1, original_delta * 0.9)
                         logger.debug(f"🧠 Уменьшаем сложность lobotomy (средняя схожесть={avg_recent_sim:.3f})")
-               
+                
                 negative_vector, lobotomy_metadata = AdversarialInverterOptimized.adaptive_lobotomy(
                     positive_vector,
                     original_delta=original_delta
                 )
-               
+                
                 logger.debug(f"🧠 Lobotomy: Δ={original_delta:.3f} → сложность={lobotomy_metadata['complexity']}, "
                             f"inversion={lobotomy_metadata['inversion_strength']:.1f}")
-               
-            else: # twist
+                
+            else:  # twist
+                # ===========================================================
+                # 🔥 исправленная обработка twist для разных размерностей
+                # ===========================================================
                 D = positive_vector.shape[-1]
-               
+                
                 if D >= 8:
-                    num_chunks = random.choice([4, 6, 8])
+                    # Для больших размерностей - разбиваем на чанки
+                    num_chunks = min(8, D // 4)
                     chunk_size = D // num_chunks
-                   
+                    
                     chunks = []
                     for i in range(num_chunks):
                         start = i * chunk_size
                         end = (i + 1) * chunk_size if i < num_chunks - 1 else D
                         chunks.append(positive_vector[..., start:end])
-                   
+                    
                     random.shuffle(chunks)
                     twisted = torch.cat(chunks, dim=-1)
-                   
+                    
                 elif D >= 4:
+                    # Для средних размерностей - фиксированное число чанков
                     chunk_size = D // 4
                     chunks = []
                     for i in range(4):
                         start = i * chunk_size
                         end = (i + 1) * chunk_size if i < 3 else D
                         chunks.append(positive_vector[..., start:end])
-                   
-                    permutation_pattern = random.choice([
-                        [0, 2, 1, 3],
-                        [1, 0, 3, 2],
-                        [2, 3, 0, 1],
-                        [3, 1, 2, 0]
-                    ])
-                   
-                    twisted_chunks = [chunks[i] for i in permutation_pattern]
-                    twisted = torch.cat(twisted_chunks, dim=-1)
-                   
+                    
+                    # Проверяем, что все чанки имеют совместимую размерность
+                    chunk_lengths = [c.shape[-1] for c in chunks]
+                    if len(set(chunk_lengths)) == 1 or all(l == chunk_lengths[0] for l in chunk_lengths):
+                        # Все чанки одинаковой длины - можно переставлять
+                        permutation_pattern = random.choice([
+                            [0, 2, 1, 3],
+                            [1, 0, 3, 2],
+                            [2, 3, 0, 1],
+                            [3, 1, 2, 0]
+                        ])
+                        twisted_chunks = [chunks[i] for i in permutation_pattern]
+                        twisted = torch.cat(twisted_chunks, dim=-1)
+                    else:
+                        # Чанки разной длины - используем случайную перестановку индексов
+                        indices = torch.randperm(D)
+                        twisted = positive_vector[..., indices]
                 else:
-                    idx = torch.randperm(D)
-                    twisted = positive_vector[..., idx]
-               
+                    # Для маленьких размерностей - случайная перестановка
+                    indices = torch.randperm(D)
+                    twisted = positive_vector[..., indices]
+                
                 complexity = 0.3 + random.random() * 0.2
                 negative_vector = torch.lerp(positive_vector, twisted, complexity)
-           
-            if method == 'lobotomy':
-                method_min_similarity = getattr(self, 'min_similarity_lobotomy', -0.7)
-                method_max_similarity = getattr(self, 'max_similarity_lobotomy', -0.2)
-                is_negative_similarity = True
-            elif method == 'twist':
-                method_min_similarity = getattr(self, 'min_similarity_twist', 0.4)
-                method_max_similarity = getattr(self, 'max_similarity_twist', 0.9)
-                is_negative_similarity = False
-            else: # chimera
-                method_min_similarity = getattr(self, 'min_similarity_chimera', 0.8)
-                method_max_similarity = getattr(self, 'max_similarity_chimera', 0.95)
-                is_negative_similarity = False
-           
+            
+            # Проверка схожести и коррекция
             similarity = F.cosine_similarity(
                 positive_vector.unsqueeze(0),
                 negative_vector.unsqueeze(0)
             ).item()
-           
-            logger.debug(f"🔍 {method}: similarity={similarity:.3f}, диапазон=[{method_min_similarity:.2f}, {method_max_similarity:.2f}]")
-           
-            needs_adjustment = False
-            adjustment_type = None
-           
-            if is_negative_similarity:
-                if similarity > method_max_similarity:
-                    logger.debug(f"⚠ Lobotomy недостаточно отличается: similarity={similarity:.3f} > {method_max_similarity:.3f}")
-                    needs_adjustment = True
-                    adjustment_type = 'stronger'
-                elif similarity < method_min_similarity:
-                    logger.debug(f"⚠ Lobotomy слишком отличается: similarity={similarity:.3f} < {method_min_similarity:.2f}")
-                    needs_adjustment = True
-                    adjustment_type = 'weaker'
-            else:
-                if similarity > method_max_similarity:
-                    logger.debug(f"⚠ {method} слишком похож: similarity={similarity:.3f} > {method_max_similarity:.3f}")
-                    needs_adjustment = True
-                    adjustment_type = 'stronger'
-                elif similarity < method_min_similarity:
-                    logger.debug(f"⚠ {method} слишком отличается: similarity={similarity:.3f} < {method_min_similarity:.3f}")
-                    needs_adjustment = True
-                    adjustment_type = 'weaker'
-           
-            if needs_adjustment and adjustment_type == 'stronger':
-                logger.debug(f"🔄 Усиливаем {method}...")
-               
-                if method == 'lobotomy':
-                    vector_dim = positive_vector.shape[-1]
-                    suppression_k = max(1, int(vector_dim * 0.25))
-                    boost_k = max(1, int(vector_dim * 0.4))
-                   
-                    negative_vector = AdversarialInverterOptimized.feature_lobotomy(
-                        positive_vector,
-                        suppression_k=suppression_k,
-                        boost_k=boost_k,
-                        inversion_strength=2.5
-                    )
-                elif method == 'chimera':
-                    negative_vector = AdversarialInverterOptimized.create_chimera(
-                        positive_vector, other_vector, intensity=0.6
-                    )
-                else: # twist
-                    complexity = 0.7
-                    negative_vector = torch.lerp(positive_vector, twisted, complexity)
-               
-                similarity = F.cosine_similarity(
-                    positive_vector.unsqueeze(0),
-                    negative_vector.unsqueeze(0)
-                ).item()
-               
-                logger.debug(f"✅ Усиленный {method}: новая схожесть={similarity:.3f}")
-           
-            elif needs_adjustment and adjustment_type == 'weaker':
-                logger.debug(f"🔄 Ослабляем {method}...")
-               
-                if method == 'lobotomy':
-                    vector_dim = positive_vector.shape[-1]
-                    suppression_k = max(1, int(vector_dim * 0.05))
-                    boost_k = max(1, int(vector_dim * 0.1))
-                   
-                    negative_vector = AdversarialInverterOptimized.feature_lobotomy(
-                        positive_vector,
-                        suppression_k=suppression_k,
-                        boost_k=boost_k,
-                        inversion_strength=1.0
-                    )
-                elif method == 'chimera':
-                    negative_vector = AdversarialInverterOptimized.create_chimera(
-                        positive_vector, other_vector, intensity=0.1
-                    )
-                else: # twist
-                    complexity = 0.1
-                    negative_vector = torch.lerp(positive_vector, twisted, complexity)
-               
-                similarity = F.cosine_similarity(
-                    positive_vector.unsqueeze(0),
-                    negative_vector.unsqueeze(0)
-                ).item()
-               
-                logger.debug(f"✅ Ослабленный {method}: новая схожесть={similarity:.3f}")
-           
-            final_check = False
-            if is_negative_similarity:
-                final_check = (method_min_similarity <= similarity <= method_max_similarity)
-            else:
-                final_check = (method_min_similarity <= similarity <= method_max_similarity)
-           
-            if not final_check:
-                logger.debug(f"❌ {method} окончательно не подходит: similarity={similarity:.3f}")
-                return None
-           
-            # 🔥 ИСПРАВЛЕНИЕ 3: Используем deepcopy вместо copy()
-            negative_thought = copy.deepcopy(positive_thought)
-           
+            
+            # ===========================================================
+            # 🔥 оптимизированное копирование (без deepcopy)
+            # ===========================================================
+            negative_thought = {}
+            negative_thought.update(positive_thought)  # копируем поля
+            
             if method == 'chimera':
                 reward_factor = 0.3
                 delta_factor = 0.4
@@ -4747,7 +4767,7 @@ class AdaptiveMemoryHeads(nn.Module):
                 delta_factor = 0.3
                 state = "empty_shell"
                 method_description = f"Лоботомия"
-               
+                
                 if 'lobotomy_metadata' in locals():
                     negative_thought.update({
                         "lobotomy_complexity": lobotomy_metadata.get('complexity', 'unknown'),
@@ -4755,18 +4775,18 @@ class AdaptiveMemoryHeads(nn.Module):
                         "lobotomy_suppression_ratio": round(lobotomy_metadata.get('suppression_ratio', 0.1), 3),
                         "estimated_complexity": round(lobotomy_metadata.get('estimated_similarity', 0.7) * 2.0, 3)
                     })
-            else: # twist
+            else:  # twist
                 reward_factor = 0.35
                 delta_factor = 0.5
                 state = "logical_fallacy"
                 method_description = f"Логический вывих (complexity={complexity:.2f})"
-           
+            
             original_reward = positive_thought.get('reward', 0.5)
             original_delta = positive_thought.get('delta', 1.0)
             original_surprise = positive_thought.get('surprise', 0.1)
-           
+            
             negative_vector_normalized = F.normalize(negative_vector, dim=-1)
-           
+            
             negative_thought.update({
                 "type": "hard_negative",
                 "method": method,
@@ -4785,15 +4805,15 @@ class AdaptiveMemoryHeads(nn.Module):
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "age": 0
             })
-           
+            
             max_total_hard = int(len(thoughts) * 0.4)
-           
+            
             if total_hard >= max_total_hard:
                 logger.debug(f"⚖️ Достигнут лимит Hard Negatives: {total_hard} >= {max_total_hard}")
                 return None
-           
+            
             return negative_thought
-           
+            
         except Exception as e:
             logger.warning(f"⚠ Ошибка генерации Hard Negative ({method if 'method' in locals() else 'unknown'}): {e}")
             import traceback
@@ -4903,6 +4923,9 @@ class AdaptiveMemoryHeads(nn.Module):
        
         logger.info(f"🧹 ЦЕЛЕВОЕ РАСПРЕДЕЛЕНИЕ: 👍{target_positive} | ⚔️{target_hard_negative} | 🔥{target_gaslight}")
        
+        # ===========================================================
+        # Отбор positive мыслей
+        # ===========================================================
         keep_positive = []
         if positive_thoughts and target_positive > 0:
             sorted_positive = sorted(
@@ -4927,6 +4950,9 @@ class AdaptiveMemoryHeads(nn.Module):
             keep_positive = filtered_positive[:target_positive]
             logger.info(f"🏆 Отобрано элиты: {len(keep_positive)} из {len(filtered_positive)} (возрастной фильтр)")
        
+        # ===========================================================
+        # Отбор hard negative мыслей
+        # ===========================================================
         keep_hard_negative = []
         if hard_negative_thoughts and target_hard_negative > 0:
             recent_hard_negatives = []
@@ -4945,11 +4971,14 @@ class AdaptiveMemoryHeads(nn.Module):
                
                 keep_hard_negative = sorted_hard[:target_hard_negative]
        
+        # ===========================================================
+        # Отбор gaslight мыслей
+        # ===========================================================
         keep_gaslight = []
         if gaslight_thoughts and target_gaslight > 0:
             recent_gaslight = []
             for t in gaslight_thoughts:
-                dissonance = abs(t.get('original_reward',0.9) - t.get('reward',-0.9))
+                dissonance = abs(t.get('original_reward', 0.9) - t.get('reward', -0.9))
                 max_age = t.get('max_age', int(dissonance * self.max_age_gaslight))
                 if t.get('age', 0) < max_age:
                     recent_gaslight.append(t)
@@ -4963,6 +4992,9 @@ class AdaptiveMemoryHeads(nn.Module):
                
                 keep_gaslight = sorted_gaslight[:target_gaslight]
        
+        # ===========================================================
+        # Гарантия минимального количества каждого типа
+        # ===========================================================
         MIN_PER_TYPE = 5
        
         if len(keep_positive) < MIN_PER_TYPE and len(positive_thoughts) >= MIN_PER_TYPE:
@@ -4985,38 +5017,84 @@ class AdaptiveMemoryHeads(nn.Module):
             remaining = [t for t in gaslight_thoughts if t not in keep_gaslight]
             if remaining:
                 additional = sorted(remaining,
-                                  key=lambda x: abs(x.get('original_reward',0.9)-x.get('reward',-0.9)),
+                                  key=lambda x: abs(x.get('original_reward', 0.9) - x.get('reward', -0.9)),
                                   reverse=True)[:MIN_PER_TYPE - len(keep_gaslight)]
                 keep_gaslight.extend(additional)
        
-        sorted_thoughts = keep_positive + keep_hard_negative + keep_gaslight
+        # ===========================================================
+        # 🔥 безопасная дедупликация по step
+        # ===========================================================
+        all_candidates = keep_positive + keep_hard_negative + keep_gaslight
        
-        if len(sorted_thoughts) < keep_count * 0.5:
-            logger.warning(f"⚠ Мало отобранных мыслей: {len(sorted_thoughts)}/{keep_count}")
-           
+        if len(all_candidates) < keep_count * 0.5:
+            logger.warning(f"⚠ Мало отобранных мыслей: {len(all_candidates)}/{keep_count}")
+            
             all_candidates = []
-           
+            
             if positive_thoughts:
                 best_pos = sorted(positive_thoughts,
                                 key=lambda x: self._get_thought_score(x, 'positive'),
                                 reverse=True)[:keep_count//3]
                 all_candidates.extend(best_pos)
-           
+            
             if hard_negative_thoughts:
                 best_hn = sorted(hard_negative_thoughts,
                                key=lambda x: self._get_thought_score(x, 'hard_negative'),
                                reverse=True)[:keep_count//3]
                 all_candidates.extend(best_hn)
-           
+            
             if gaslight_thoughts:
                 best_gl = sorted(gaslight_thoughts,
                                key=lambda x: self._get_thought_score(x, 'gaslight'),
                                reverse=True)[:keep_count//3]
                 all_candidates.extend(best_gl)
-           
-            all_candidates = list({t.get('step', id(t)): t for t in all_candidates}.values())
+            
+            # 🔥 ИСПРАВЛЕНИЕ 9: дедупликация по step (более надёжно)
+            unique_by_step = {}
+            for t in all_candidates:
+                step_key = t.get('step')
+                if step_key is not None:
+                    # Если step есть, используем его как ключ
+                    if step_key not in unique_by_step:
+                        unique_by_step[step_key] = t
+                else:
+                    # Если step нет, используем tuple из основных полей
+                    fallback_key = (t.get('type'), t.get('timestamp'), t.get('snapshot_norm'))
+                    if fallback_key not in unique_by_step:
+                        unique_by_step[fallback_key] = t
+            
+            all_candidates = list(unique_by_step.values())
             sorted_thoughts = all_candidates[:keep_count]
-       
+        else:
+            # 🔥 ИСПРАВЛЕНИЕ 9: дедупликация и для основного случая
+            unique_by_step = {}
+            for t in all_candidates:
+                step_key = t.get('step')
+                if step_key is not None:
+                    if step_key not in unique_by_step:
+                        unique_by_step[step_key] = t
+                else:
+                    fallback_key = (t.get('type'), t.get('timestamp'), t.get('snapshot_norm'))
+                    if fallback_key not in unique_by_step:
+                        unique_by_step[fallback_key] = t
+            
+            sorted_thoughts = list(unique_by_step.values())
+            
+            # Если после дедупликации всё ещё нужно больше мыслей, добавляем из резерва
+            if len(sorted_thoughts) < keep_count:
+                remaining_count = keep_count - len(sorted_thoughts)
+                all_thoughts = positive_thoughts + hard_negative_thoughts + gaslight_thoughts
+                existing_steps = {t.get('step') for t in sorted_thoughts if t.get('step') is not None}
+                
+                for t in all_thoughts:
+                    if len(sorted_thoughts) >= keep_count:
+                        break
+                    step = t.get('step')
+                    if step is None or step not in existing_steps:
+                        sorted_thoughts.append(t)
+                        if step is not None:
+                            existing_steps.add(step)
+        
         return sorted_thoughts
         
     def _log_detailed_cleaning_stats(self, positive_thoughts, hard_negative_thoughts, gaslight_thoughts):
@@ -5279,12 +5357,12 @@ class AdaptiveMemoryHeads(nn.Module):
             'control_weights': {k: v.item() for k, v in self.control_weights.items()},
             'hard_negative_stats': self.hard_negative_stats,
             'config_updates': self.config_updates,
-            # 🔥 Сохраняем текущее состояние контрастного лосса
+            #  Сохраняем текущее состояние контрастного лосса
             'contrastive_loss_margin': self.contrastive_loss_fn._current_margin.item() if hasattr(self, 'contrastive_loss_fn') else None,
             'memory_gate': self.memory_gate.item() if hasattr(self, 'memory_gate') else None,  # для обратной совместимости
             
             # ===========================================================
-            # 🔥🔥🔥 MOTIVATION MODULE + GATE STATE
+            # 🔥 MOTIVATION MODULE + GATE STATE
             # ===========================================================
             'motivation_module_state': self.motivation_module.state_dict() if hasattr(self, 'motivation_module') else None,
             'gate_state': {
@@ -5432,8 +5510,7 @@ class AdaptiveMemoryHeads(nn.Module):
         # ===========================================================
         # 🔥 ЗАГРУЗКА MOTIVATION MODULE + GATE
         # ===========================================================
-        
-        # Загрузка Motivation Module
+
         if 'motivation_module_state' in checkpoint and checkpoint['motivation_module_state'] is not None:
             if hasattr(self, 'motivation_module'):
                 try:
@@ -5442,10 +5519,51 @@ class AdaptiveMemoryHeads(nn.Module):
                     logger.info("✅ MotivationModule загружен")
                 except Exception as e:
                     logger.warning(f"⚠ Ошибка загрузки MotivationModule: {e}")
+                    # Создаём новый при ошибке
+                    if not hasattr(self, 'motivation_module'):
+                        self.motivation_module = MotivationModule(self.config)
+                        self.motivation_module = self.motivation_module.to(device)
+                        logger.info("🔥 Создан новый MotivationModule (ошибка загрузки)")
             else:
-                logger.warning("⚠ MotivationModule не найден в модели, но есть в чекпоинте")
+                logger.warning("⚠ MotivationModule не найден в модели, но есть в чекпоинте. Создаём новый.")
+                self.motivation_module = MotivationModule(self.config)
+                self.motivation_module = self.motivation_module.to(device)
+        else:
+            # 🔥 ИСПРАВЛЕНИЕ 15: создаём MotivationModule если его нет в чекпоинте
+            if not hasattr(self, 'motivation_module'):
+                self.motivation_module = MotivationModule(self.config)
+                self.motivation_module = self.motivation_module.to(device)
+                logger.info("🔥 Создан новый MotivationModule (не было в чекпоинте)")
         
-        # Загрузка Gate состояния
+        # ===========================================================
+        # 🔥 ИСПРАВЛЕНИЕ: безопасная конвертация memory_gate
+        # ===========================================================
+        if 'memory_gate' in checkpoint and checkpoint['memory_gate'] is not None:
+            if hasattr(self, 'memory_gate_logit'):
+                old_gate = checkpoint['memory_gate']
+                # 🔥 Безопасная конвертация
+                if isinstance(old_gate, (int, float)):
+                    old_gate = float(old_gate)
+                    # Защита от граничных значений
+                    if old_gate <= 0.0:
+                        old_gate = 0.05
+                    elif old_gate >= 1.0:
+                        old_gate = 0.95
+                    
+                    # Безопасное вычисление logit
+                    old_gate_clipped = np.clip(old_gate, 0.01, 0.99)
+                    old_logit = np.log(old_gate_clipped / (1.0 - old_gate_clipped + 1e-8))
+                    self.memory_gate_logit.data.fill_(old_logit)
+                    if hasattr(self, 'memory_gate_ema'):
+                        self.memory_gate_ema.fill_(old_gate)
+                    logger.info(f"🔄 Конвертирован старый memory_gate ({old_gate:.4f}) в новый формат")
+                else:
+                    logger.warning(f"⚠ Неожиданный тип memory_gate: {type(old_gate)}")
+            elif hasattr(self, 'memory_gate'):
+                self.memory_gate.data.fill_(checkpoint['memory_gate'])
+                logger.info(f"🔙 Загружен старый memory_gate: {self.memory_gate.item():.4f}")
+        
+        # Загрузка Gate состояния (новый формат)
         if 'gate_state' in checkpoint:
             gs = checkpoint['gate_state']
             device = next(self.parameters()).device
@@ -5477,21 +5595,6 @@ class AdaptiveMemoryHeads(nn.Module):
                     logger.info(f"✅ Загружен {key}: {getattr(self, key).item():.4f}")
             
             logger.info("✅ Dynamic Memory Gate успешно загружен")
-        else:
-            # Обратная совместимость: старый memory_gate
-            if 'memory_gate' in checkpoint and checkpoint['memory_gate'] is not None:
-                if hasattr(self, 'memory_gate_logit'):
-                    # Конвертируем старый gate в новый формат
-                    old_gate = checkpoint['memory_gate']
-                    # inverse sigmoid для получения logit
-                    old_logit = np.log(old_gate / (1 - old_gate + 1e-8))
-                    self.memory_gate_logit.data.fill_(old_logit)
-                    if hasattr(self, 'memory_gate_ema'):
-                        self.memory_gate_ema.fill_(old_gate)
-                    logger.info(f"🔄 Конвертирован старый memory_gate ({old_gate:.4f}) в новый формат")
-                elif hasattr(self, 'memory_gate'):
-                    self.memory_gate.data.fill_(checkpoint['memory_gate'])
-                    logger.info(f"🔙 Загружен старый memory_gate: {self.memory_gate.item():.4f}")
         
         logger.info(f"✅ Checkpoint загружен: {checkpoint_path}")
         logger.info(f"📊 Step: {self.step_count}, Sleep cycles: {self.sleep_cycles}")
@@ -5544,8 +5647,7 @@ class MotivationModule(nn.Module):
             
         quality_score = self.evaluator(x).squeeze(-1)          # [batch]
         
-        # 🔥 ИСПРАВЛЕНИЕ: Пуленепробиваемая нормализация весов
-        # Softmax гарантирует, что веса положительные и в сумме дают 1.0
+        # 🔥 нормализация весов
         weights = torch.softmax(torch.stack([
             self.novelty_weight, 
             self.consistency_weight, 
@@ -5556,7 +5658,6 @@ class MotivationModule(nn.Module):
         w_cons = weights[1]
         w_cur = weights[2]
         
-        # Теперь мотивация математически не может превысить 1.0
         motivation = (
             surprise * w_nov +
             quality_score * w_cons +
@@ -5569,9 +5670,7 @@ class MotivationModule(nn.Module):
         
         motivation = torch.clamp(motivation.mean(), 0.0, 1.0)
         
-        # 🔥 Сохраняем для использования в loss
-        self._last_motivation = motivation.detach().clone()
-        self._last_motivation.requires_grad = True  # важно для градиентов
+        self._last_motivation = motivation.detach()
         
         return motivation
  
